@@ -1,0 +1,4 @@
+# Build output (the .exe is attached to GitHub Releases instead)
+*.exe
+src/*.ico
+*.tmp
