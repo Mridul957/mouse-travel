@@ -2,3 +2,6 @@
 *.exe
 src/*.ico
 *.tmp
+
+# Local design-review renders
+screenshots-review/

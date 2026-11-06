@@ -11,6 +11,7 @@ using System.Drawing.Text;
 using System.Globalization;
 using System.IO;
 using System.Management;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -686,62 +687,80 @@ class TrayApp : ApplicationContext
     }
 
     // --- system
-    // Windows only launches a Run entry that is also switched on under StartupApproved
-    // (the toggle in Task Manager > Startup apps): first byte 02 = enabled, 03 = disabled.
-    const string ApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+    // Start with Windows = a shortcut in the user's Startup folder. (Some PCs skip HKCU\...\Run
+    // entries even when approved; the Startup folder is launched reliably.) Task Manager's
+    // Startup apps toggle for it lives under StartupApproved\StartupFolder: odd first byte = disabled.
+    const string ApprovedRunKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+    const string ApprovedFolderKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder";
+    const string ShortcutName = "Mouse Travel.lnk";
 
-    static byte[] Approval()
+    static string ShortcutPath { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), ShortcutName); } }
+
+    static bool Disabled(string approvedKey, string name)
     {
-        try { using (var k = Registry.CurrentUser.OpenSubKey(ApprovedKey)) return k == null ? null : k.GetValue("MouseTravel") as byte[]; }
-        catch { return null; }
+        try
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(approvedKey))
+            {
+                var a = k == null ? null : k.GetValue(name) as byte[];
+                return a != null && a.Length > 0 && (a[0] & 1) == 1;
+            }
+        }
+        catch { return false; }
+    }
+
+    static void DeleteValue(string key, string name)
+    {
+        try { using (var k = Registry.CurrentUser.OpenSubKey(key, true)) if (k != null) k.DeleteValue(name, false); }
+        catch { }
     }
 
     static bool IsStartup()
     {
-        try
-        {
-            using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
-            {
-                if (k == null || k.GetValue("MouseTravel") == null) return false;
-            }
-            byte[] a = Approval();
-            return a == null || a.Length == 0 || (a[0] & 1) == 0; // odd first byte = disabled
-        }
-        catch { return false; }
+        return File.Exists(ShortcutPath) && !Disabled(ApprovedFolderKey, ShortcutName);
     }
 
     static void SetStartup(bool on)
     {
         try
         {
-            using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
+            if (on)
             {
-                if (on) k.SetValue("MouseTravel", "\"" + Application.ExecutablePath + "\"");
-                else k.DeleteValue("MouseTravel", false);
+                Type t = Type.GetTypeFromProgID("WScript.Shell");
+                object shell = Activator.CreateInstance(t);
+                object lnk = t.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { ShortcutPath });
+                Type lt = lnk.GetType();
+                lt.InvokeMember("TargetPath", BindingFlags.SetProperty, null, lnk, new object[] { Application.ExecutablePath });
+                lt.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, lnk, new object[] { Path.GetDirectoryName(Application.ExecutablePath) });
+                lt.InvokeMember("Description", BindingFlags.SetProperty, null, lnk, new object[] { "Mouse Travel" });
+                lt.InvokeMember("Save", BindingFlags.InvokeMethod, null, lnk, null);
+                Marshal.FinalReleaseComObject(lnk);
+                Marshal.FinalReleaseComObject(shell);
             }
-            using (var k = Registry.CurrentUser.CreateSubKey(ApprovedKey))
-            {
-                if (on) k.SetValue("MouseTravel", new byte[] { 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, RegistryValueKind.Binary);
-                else k.DeleteValue("MouseTravel", false);
-            }
+            else if (File.Exists(ShortcutPath)) File.Delete(ShortcutPath);
+            DeleteValue(ApprovedFolderKey, ShortcutName);
         }
         catch { }
     }
 
-    // Older builds wrote only the Run entry, which Windows skips. Repair it (and a moved .exe path),
-    // but leave it alone if someone switched it off in Task Manager.
+    // Move older installs from the Run key to the Startup folder (unless switched off in Task Manager),
+    // and keep the shortcut pointing at this .exe if it was moved.
     static void RepairStartup()
     {
         try
         {
-            string want = "\"" + Application.ExecutablePath + "\"";
-            using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
+            bool hadRun;
+            using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) hadRun = k != null && k.GetValue("MouseTravel") != null;
+            if (hadRun)
             {
-                object cur = k == null ? null : k.GetValue("MouseTravel");
-                if (cur == null) return;
-                byte[] a = Approval();
-                bool disabledByUser = a != null && a.Length > 0 && (a[0] & 1) == 1;
-                if (!disabledByUser && (a == null || !want.Equals(cur as string, StringComparison.OrdinalIgnoreCase))) SetStartup(true);
+                bool wasOff = Disabled(ApprovedRunKey, "MouseTravel");
+                DeleteValue(RunKey, "MouseTravel");
+                DeleteValue(ApprovedRunKey, "MouseTravel");
+                if (!wasOff) SetStartup(true);
+            }
+            else if (File.Exists(ShortcutPath) && !Disabled(ApprovedFolderKey, ShortcutName))
+            {
+                SetStartup(true); // cheap, and fixes a stale target path
             }
         }
         catch { }
@@ -797,8 +816,9 @@ static class Fonts
 
 // Colors follow the Windows light/dark setting (and High Contrast). The odometer is a physical
 // object, so it stays dark in both. Contrast, worst case per palette:
-//   dark:  secondary #A3A6C2 on raised #232539 = 6.4:1, ink on mint = 12.6:1
-//   light: secondary #5D6080 on white = 6.1:1, accent text #0B7A57 on #F5F5F9 = 4.9:1
+//   dark:  secondary #A1A1A6 on raised #222222 = 6.2:1, ink on road-yellow = 11.8:1
+//   light: secondary #6B6B70 on white = 5.3:1, accent text #8A5A00 on #F6F6F4 = 5.5:1
+// Neutral grays with one accent: the yellow of a road's lane markings. No gradients.
 class Palette
 {
     public bool Dark;
@@ -831,9 +851,9 @@ class Palette
     {
         return new Palette
         {
-            Dark = true, Surface = Hex(0x15161F), Raised = Hex(0x232539), Content = Hex(0xF4F5FA), Secondary = Hex(0xA3A6C2),
-            Hairline = Hex(0x2E3048), Accent = Hex(0x7AF0C4), AccentText = Hex(0x7AF0C4), OnAccent = Hex(0x0E1A16),
-            Signal = Hex(0xFF8ABE), Road = Hex(0x262840), RoadLine = Hex(0x5F6286), TrackOff = Hex(0x5F6286), Bezel = Hex(0x07080D),
+            Dark = true, Surface = Hex(0x161616), Raised = Hex(0x222222), Content = Hex(0xF5F5F3), Secondary = Hex(0xA1A1A6),
+            Hairline = Hex(0x2E2E30), Accent = Hex(0xFFC93C), AccentText = Hex(0xFFC93C), OnAccent = Hex(0x161616),
+            Signal = Hex(0xFFC93C), Road = Hex(0x262626), RoadLine = Hex(0x5A5A5E), TrackOff = Hex(0x636366), Bezel = Hex(0x0A0A0A),
         };
     }
 
@@ -841,9 +861,9 @@ class Palette
     {
         return new Palette
         {
-            Dark = false, Surface = Hex(0xF5F5F9), Raised = Hex(0xFFFFFF), Content = Hex(0x17182A), Secondary = Hex(0x5D6080),
-            Hairline = Hex(0xE2E3EC), Accent = Hex(0x3DDBA3), AccentText = Hex(0x0B7A57), OnAccent = Hex(0x0E1A16),
-            Signal = Hex(0xE0457F), Road = Hex(0xE4E5EE), RoadLine = Hex(0xA9ABC0), TrackOff = Hex(0x85879F), Bezel = Hex(0x2A2C40),
+            Dark = false, Surface = Hex(0xF6F6F4), Raised = Hex(0xFFFFFF), Content = Hex(0x161616), Secondary = Hex(0x6B6B70),
+            Hairline = Hex(0xE4E4E1), Accent = Hex(0xFFC93C), AccentText = Hex(0x8A5A00), OnAccent = Hex(0x161616),
+            Signal = Hex(0x8A5A00), Road = Hex(0xEAEAE7), RoadLine = Hex(0xB0B0B3), TrackOff = Hex(0x8E8E93), Bezel = Hex(0x222222),
         };
     }
 
@@ -948,10 +968,14 @@ class Toggle : CheckBox
 
         float tw = 40 * sc, th = 22 * sc;
         var track = new RectangleF(3 * sc, (Height - th) / 2, tw, th);
-        using (var path = Art.Round(track, th / 2)) using (var b = new SolidBrush(Checked ? pal.Accent : pal.TrackOff)) g.FillPath(b, path);
+        using (var path = Art.Round(track, th / 2))
+        {
+            using (var b = new SolidBrush(Checked ? pal.Accent : pal.TrackOff)) g.FillPath(b, path);
+            if (Checked && !pal.Dark) using (var p = new Pen(pal.AccentText)) g.DrawPath(p, path); // yellow alone is too faint on light gray
+        }
         float d = th - 6 * sc;
         float kx = Checked ? track.Right - 3 * sc - d : track.X + 3 * sc;
-        using (var b = new SolidBrush(Color.White)) g.FillEllipse(b, kx, track.Y + 3 * sc, d, d);
+        using (var b = new SolidBrush(Checked ? pal.OnAccent : Color.White)) g.FillEllipse(b, kx, track.Y + 3 * sc, d, d);
         if (Focused && ShowFocusCues)
         {
             var ring = RectangleF.Inflate(track, 2 * sc, 2 * sc);
@@ -1122,11 +1146,12 @@ class Popup : Form
         float rad = r.Height / 2;
         using (var path = Art.Round(r, rad)) using (var b = new SolidBrush(pal.Road)) g.FillPath(b, path);
         float carX = r.X + r.Height * 0.6f + (r.Width - r.Height * 1.2f) * frac;
-        if (frac > 0)
-            using (var path = Art.Round(new RectangleF(r.X, r.Y, carX - r.X + rad * 0.3f, r.Height), rad))
-            using (var b = new SolidBrush(Color.FromArgb(pal.Dark ? 90 : 150, pal.Accent))) g.FillPath(b, path);
+        // a solid lane line behind the mouse (distance driven), dashes on the road ahead, then a checkered flag
+        float laneStart = r.X + rad * 0.8f;
+        if (carX > laneStart)
+            using (var pen = new Pen(pal.Dark ? pal.Accent : pal.AccentText, S(3)) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+                g.DrawLine(pen, laneStart, r.Y + rad, carX, r.Y + rad);
 
-        // dashes on the road ahead, then a little checkered flag
         float flag = r.Height * 0.48f, flagX = r.Right - rad - flag / 2;
         if (flagX - S(6) > carX + rad)
             using (var pen = new Pen(pal.RoadLine, S(2))) { pen.DashPattern = new float[] { 3, 3 }; g.DrawLine(pen, carX + rad, r.Y + rad, flagX - S(6), r.Y + rad); }
@@ -1140,7 +1165,7 @@ class Popup : Form
         g.TranslateTransform(carX, r.Y + rad);
         g.RotateTransform(90);
         float mw = r.Height * 0.8f, mh = mw * 1.4f;
-        Art.DrawMouse(g, new RectangleF(-mw / 2, -mh / 2, mw, mh), Art.Mint);
+        Art.DrawMouse(g, new RectangleF(-mw / 2, -mh / 2, mw, mh), Art.Yellow);
         g.Restore(state);
     }
 
@@ -1337,8 +1362,8 @@ class SetupForm : Form
                 using (var body = Art.Round(r, S(5))) g.FillPath(bezel, body);
 
                 var screen = new RectangleF(r.X + S(4), r.Y + S(4), r.Width - S(8), r.Height - S(8));
-                using (var glow = new LinearGradientBrush(screen, Color.FromArgb(95, Art.Mint), Color.FromArgb(25, Art.Mint), 45f))
-                using (var sp = Art.Round(screen, S(2))) g.FillPath(glow, sp);
+                using (var glass = new SolidBrush(Palette.Shade(pal.Bezel, 0.14f)))
+                using (var sp = Art.Round(screen, S(2))) g.FillPath(glass, sp);
 
                 var label = Rectangle.Round(screen);
                 var top = new Rectangle(label.X, label.Y, label.Width, label.Height / 2 + S(4));
@@ -1355,9 +1380,9 @@ class SetupForm : Form
 
 static class Art
 {
-    public static readonly Color Mint = Palette.Hex(0x7AF0C4);
-    public static readonly Color Pink = Palette.Hex(0xFF8ABE);
-    static readonly Color Ink = Palette.Hex(0x15161F);
+    public static readonly Color Yellow = Palette.Hex(0xFFC93C);
+    static readonly Color Ink = Palette.Hex(0x161616);
+    static readonly Color Paper = Palette.Hex(0xF5F5F3);
 
     public static GraphicsPath Round(RectangleF r, float radius)
     {
@@ -1391,7 +1416,7 @@ static class Art
         }
         float ww = r.Width * 0.2f, wh = r.Height * 0.2f;
         var wheel = new RectangleF(r.X + (r.Width - ww) / 2, r.Y + r.Height * 0.16f, ww, wh);
-        using (var path = Round(wheel, ww / 2)) using (var b = new SolidBrush(Pink)) g.FillPath(b, path);
+        using (var path = Round(wheel, ww / 2)) using (var b = new SolidBrush(Ink)) g.FillPath(b, path);
         g.SmoothingMode = old;
     }
 
@@ -1409,8 +1434,8 @@ static class Art
         SizeF size = OdometerSize(w, h, intDigits);
         var housing = new RectangleF(at.X, at.Y, size.Width, size.Height);
         using (var path = Round(housing, w * 0.24f))
-        using (var b = new SolidBrush(Palette.Hex(0x07080D)))
-        using (var p = new Pen(Palette.Hex(0x2E3048)))
+        using (var b = new SolidBrush(Palette.Hex(0x0A0A0A)))
+        using (var p = new Pen(Palette.Hex(0x2E2E30)))
         {
             g.FillPath(b, path);
             g.DrawPath(p, path);
@@ -1428,7 +1453,7 @@ static class Art
                 {
                     x += dot - gap;
                     float r = w * 0.075f;
-                    using (var b = new SolidBrush(Palette.Hex(0xF4F5FA))) g.FillEllipse(b, x - dot / 2 - r, y + h * 0.76f - r, r * 2, r * 2);
+                    using (var b = new SolidBrush(Paper)) g.FillEllipse(b, x - dot / 2 - r, y + h * 0.76f - r, r * 2, r * 2);
                 }
                 double pow = Math.Pow(10, place);
                 double whole = Math.Floor(units / pow);
@@ -1447,21 +1472,13 @@ static class Art
         using (var path = Round(r, r.Width * 0.14f))
         {
             g.SetClip(path, CombineMode.Intersect);
-            using (var b = new SolidBrush(tenths ? Mint : Palette.Hex(0x1E2033))) g.FillRectangle(b, r);
+            using (var b = new SolidBrush(tenths ? Yellow : Palette.Hex(0x1F1F1F))) g.FillRectangle(b, r);
             using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-            using (var ink = new SolidBrush(tenths ? Palette.Hex(0x0E1A16) : Palette.Hex(0xF4F5FA)))
+            using (var ink = new SolidBrush(tenths ? Ink : Paper))
             {
                 float off = f * r.Height, nudge = r.Height * 0.03f;
                 g.DrawString(digit.ToString(Fun.CI), font, ink, new RectangleF(r.X, r.Y - off + nudge, r.Width, r.Height), sf);
                 if (f > 0) g.DrawString(((digit + 1) % 10).ToString(Fun.CI), font, ink, new RectangleF(r.X, r.Y - off + r.Height + nudge, r.Width, r.Height), sf);
-            }
-            using (var shade = new LinearGradientBrush(new RectangleF(r.X, r.Y - 1, r.Width, r.Height + 2), Color.Black, Color.Black, 90f))
-            {
-                var blend = new ColorBlend();
-                blend.Colors = new[] { Color.FromArgb(150, 0, 0, 0), Color.FromArgb(0, 0, 0, 0), Color.FromArgb(0, 0, 0, 0), Color.FromArgb(150, 0, 0, 0) };
-                blend.Positions = new[] { 0f, 0.32f, 0.68f, 1f };
-                shade.InterpolationColors = blend;
-                g.FillRectangle(shade, r);
             }
         }
         g.Restore(state);
@@ -1476,7 +1493,7 @@ static class Art
         {
             g.Clear(Color.Transparent);
             float w = s * 0.66f, h = s * 0.94f;
-            DrawMouse(g, new RectangleF((s - w) / 2, (s - h) / 2, w, h), Mint);
+            DrawMouse(g, new RectangleF((s - w) / 2, (s - h) / 2, w, h), Yellow);
         }
         return bmp;
     }
@@ -1534,12 +1551,11 @@ static class Art
             if (days[i] > max) { max = days[i]; best = i; }
         }
 
-        Color content = Palette.Hex(0xF4F5FA), secondary = Palette.Hex(0xA3A6C2);
         using (Graphics g = Graphics.FromImage(bmp))
-        using (var white = new SolidBrush(content))
-        using (var dim = new SolidBrush(secondary))
-        using (var mint = new SolidBrush(Mint))
-        using (var pink = new SolidBrush(Pink))
+        using (var white = new SolidBrush(Paper))
+        using (var dim = new SolidBrush(Palette.Hex(0xA1A1A6)))
+        using (var accent = new SolidBrush(Yellow))
+        using (var bar = new SolidBrush(Palette.Hex(0x3A3A3C)))
         using (var fEyebrow = Fonts.Px(26, FontStyle.Bold))
         using (var fHead = Fonts.Px(56, FontStyle.Regular))
         using (var fUnit = Fonts.DisplayPx(72, FontStyle.Bold))
@@ -1553,20 +1569,10 @@ static class Art
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-            g.Clear(Palette.Hex(0x121426));
-            using (var glowPath = new GraphicsPath())
-            {
-                glowPath.AddEllipse(520, -420, 980, 980);
-                using (var glow = new PathGradientBrush(glowPath))
-                {
-                    glow.CenterColor = Color.FromArgb(60, Mint);
-                    glow.SurroundColors = new[] { Color.FromArgb(0, Mint) };
-                    g.FillPath(glow, glowPath);
-                }
-            }
+            g.Clear(Palette.Hex(0x161616));
 
             string range = weekStart.ToString("d MMM", Fun.CI) + " – " + weekStart.AddDays(6).ToString("d MMM yyyy", Fun.CI);
-            g.DrawString("MOUSE TRAVEL · WEEKLY TRIP", fEyebrow, mint, 80, 80);
+            g.DrawString("MOUSE TRAVEL · WEEKLY TRIP", fEyebrow, accent, 80, 80);
             g.DrawString(range, fEyebrow, dim, new RectangleF(500, 80, 500, 40), right);
             g.DrawString(thisWeek ? "This week I drove my mouse" : "Last week I drove my mouse", fHead, white, 74, 140);
 
@@ -1583,30 +1589,30 @@ static class Art
             float left = 80, rightEdge = 940, top = 650, roadTop = 868, roadH = 64, bottom = roadTop - 14, bw = 88;
             float gap = (rightEdge - left - 7 * bw) / 6;
             using (var road = Round(new RectangleF(40, roadTop, 1000, roadH), roadH / 2))
-            using (var rb = new SolidBrush(Palette.Hex(0x1E2035))) g.FillPath(rb, road);
+            using (var rb = new SolidBrush(Palette.Hex(0x232323))) g.FillPath(rb, road);
             string[] labels = { "M", "T", "W", "T", "F", "S", "S" };
             for (int i = 0; i < 7; i++)
             {
                 float x = left + i * (bw + gap);
                 float h = (float)Math.Max(10, (bottom - top) * days[i] / max);
                 using (var path = Round(new RectangleF(x, bottom - h, bw, h), Math.Min(16, h / 2)))
-                    g.FillPath(i == best ? pink : mint, path);
+                    g.FillPath(i == best ? accent : bar, path);
                 if (days[i] >= 50)
-                    g.DrawString((days[i] / 1000).ToString("0.0", Fun.CI), fVal, i == best ? pink : dim, new RectangleF(x - 20, bottom - h - 44, bw + 40, 36), center);
+                    g.DrawString((days[i] / 1000).ToString("0.0", Fun.CI), fVal, i == best ? accent : dim, new RectangleF(x - 20, bottom - h - 44, bw + 40, 36), center);
                 if (i == best)
-                    g.DrawString("BEST", fTag, pink, new RectangleF(x - 20, bottom - h - 74, bw + 40, 30), center);
+                    g.DrawString("BEST", fTag, accent, new RectangleF(x - 20, bottom - h - 74, bw + 40, 30), center);
                 g.DrawString(labels[i], fDay, white, new RectangleF(x, roadTop, bw, roadH), center);
                 if (i < 6)
-                    using (var dash = new Pen(Palette.Hex(0x5F6286), 5f)) g.DrawLine(dash, x + bw + gap * 0.3f, roadTop + roadH / 2, x + bw + gap * 0.7f, roadTop + roadH / 2);
+                    using (var dash = new Pen(Palette.Hex(0x5A5A5E), 5f)) g.DrawLine(dash, x + bw + gap * 0.3f, roadTop + roadH / 2, x + bw + gap * 0.7f, roadTop + roadH / 2);
             }
             var state = g.Save();
             g.TranslateTransform(1000, roadTop + roadH / 2);
             g.RotateTransform(90);
-            DrawMouse(g, new RectangleF(-24, -35, 48, 70), Mint);
+            DrawMouse(g, new RectangleF(-24, -35, 48, 70), Yellow);
             g.Restore(state);
 
             g.DrawString("Lifetime " + Fun.Dist(lifetime) + " · " + Fun.MoonPercent(lifetime) + " of the way to the Moon", fFoot, dim, 80, 978);
-            g.DrawString("#MouseTravel", fFoot, mint, new RectangleF(600, 978, 400, 40), right);
+            g.DrawString("#MouseTravel", fFoot, accent, new RectangleF(600, 978, 400, 40), right);
         }
         return bmp;
     }
