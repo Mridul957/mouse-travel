@@ -32,6 +32,11 @@ static class Program
             File.WriteAllBytes(args[1], Art.MakeIcoBytes());
             return 0;
         }
+        if (args.Length == 1 && args[0] == "--demo-popups")
+        {
+            DemoPopups();
+            return 0;
+        }
         if (args.Length == 2 && args[0] == "--selftest")
         {
             SelfTest.Run(args[1]);
@@ -45,6 +50,30 @@ static class Program
             Application.Run(new TrayApp());
         }
         return 0;
+    }
+
+    // Shows sample milestone pop-ups one after another, without touching any saved data.
+    static void DemoPopups()
+    {
+        string[][] samples =
+        {
+            new[] { "500 m today!", "Your mouse just jogged ~5 football fields." },
+            new[] { "1 km today!", "Your mouse officially went for a walk." },
+            new[] { "5 km today!", "Timeline-scrubbing champion." },
+            new[] { "5 km all-time.", "That's a parkrun!" },
+        };
+        int i = 0;
+        Action next = null;
+        next = delegate
+        {
+            if (i >= samples.Length) { Application.ExitThread(); return; }
+            string[] s = samples[i++];
+            Toast.Pop(s[0], s[1], null, next);
+        };
+        var invoker = new Control();
+        invoker.CreateControl();
+        invoker.BeginInvoke(next);
+        Application.Run();
     }
 }
 
@@ -155,6 +184,16 @@ static class Native
     public static extern bool EnumDisplayDevices(string device, uint devNum, ref DISPLAY_DEVICE dd, uint flags);
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
     [DllImport("psapi.dll")] static extern bool EmptyWorkingSet(IntPtr process);
+    [DllImport("shell32.dll")] static extern int SHQueryUserNotificationState(out int state);
+
+    // True while a full-screen app, presentation or the lock screen is up: hold pop-ups until it ends.
+    public static bool UserBusy()
+    {
+        int s;
+        try { if (SHQueryUserNotificationState(out s) != 0) return false; }
+        catch { return false; }
+        return s == 1 || s == 2 || s == 3 || s == 4 || s == 7;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct POINT { public int X, Y; }
@@ -288,6 +327,15 @@ class Store
         return sum;
     }
 
+    // The first day anything was recorded (when the lifetime count started).
+    public DateTime FirstDay()
+    {
+        DateTime first = DateTime.Now.Date, d;
+        foreach (string k in days.Keys)
+            if (DateTime.TryParseExact(k, "yyyy-MM-dd", Fun.CI, DateTimeStyles.None, out d) && d < first) first = d;
+        return first;
+    }
+
     public double Total()
     {
         double sum = 0;
@@ -416,6 +464,7 @@ static class Monitors
 class Stats
 {
     public double Today, Week, AllTime;
+    public DateTime Since = DateTime.Now.Date;
 }
 
 class TrayApp : ApplicationContext
@@ -437,7 +486,7 @@ class TrayApp : ApplicationContext
     DateTime popupClosedAt;
     double lastShownKm;
     string lastShownDay;
-    Action balloonAction;
+    readonly List<object[]> queue = new List<object[]>(); // pending pop-ups: title, text, click action
     ToolStripMenuItem startupItem;
 
     public TrayApp()
@@ -465,8 +514,6 @@ class TrayApp : ApplicationContext
 
         tray = new NotifyIcon { Icon = Art.MakeTrayIcon(), ContextMenuStrip = menu, Visible = true, Text = "Mouse Travel" };
         tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) ShowPopup(); };
-        tray.BalloonTipClicked += delegate { var a = balloonAction; balloonAction = null; if (a != null) a(); };
-        tray.BalloonTipClosed += delegate { balloonAction = null; };
 
         pollTimer = new System.Windows.Forms.Timer { Interval = 40 };
         pollTimer.Tick += Poll;
@@ -517,13 +564,13 @@ class TrayApp : ApplicationContext
             todayLevel = level;
             store.SetS("ms.day", todayKey);
             store.SetS("ms.level", level.ToString(Fun.CI));
-            Notify("Mouse Travel", Fun.MilestoneText(level), null);
+            NotifyMilestone(Fun.MilestoneText(level));
         }
         if (lifeLevel < Fun.LifeStops.Length && allTime >= Fun.LifeStops[lifeLevel])
         {
             while (lifeLevel < Fun.LifeStops.Length && allTime >= Fun.LifeStops[lifeLevel]) lifeLevel++;
             store.SetS("ms.life", lifeLevel.ToString(Fun.CI));
-            Notify("Mouse Travel \u00B7 lifetime", Fun.LifeTexts[lifeLevel - 1], null);
+            NotifyMilestone(Fun.LifeTexts[lifeLevel - 1]);
         }
     }
 
@@ -548,6 +595,7 @@ class TrayApp : ApplicationContext
         RollDay();
         UpdateTooltip();
         CheckWeekly();
+        FlushNotification(); // shows a pop-up held back during full-screen use
         if (++houseTicks % 12 == 0 && dirty) Flush(); // save once a minute
     }
 
@@ -559,12 +607,16 @@ class TrayApp : ApplicationContext
 
     void UpdateTooltip()
     {
-        if (tray != null) tray.Text = "Mouse Travel \u00B7 today " + Fun.Dist(todayMeters);
+        if (tray != null) tray.Text = "Mouse Travel \u00B7 today " + Fun.Dist(todayMeters) + " \u00B7 lifetime " + Fun.Dist(allTime);
     }
 
     Stats GetStats()
     {
-        return new Stats { Today = todayMeters, Week = store.Range(Fun.WeekStart(DateTime.Now), DateTime.Now.Date.AddDays(1)), AllTime = allTime };
+        return new Stats
+        {
+            Today = todayMeters, Week = store.Range(Fun.WeekStart(DateTime.Now), DateTime.Now.Date.AddDays(1)),
+            AllTime = allTime, Since = store.FirstDay(),
+        };
     }
 
     void CheckWeekly()
@@ -583,10 +635,28 @@ class TrayApp : ApplicationContext
             delegate { ShareWeek(lastWs, false); });
     }
 
+    // Our own pop-up (Windows notifications may be switched off). Queued: one at a time, held while busy.
     void Notify(string title, string text, Action onClick)
     {
-        balloonAction = onClick;
-        tray.ShowBalloonTip(5000, title, text, ToolTipIcon.None);
+        queue.Add(new object[] { title, text, onClick });
+        if (queue.Count > 5) queue.RemoveAt(0);
+        FlushNotification();
+    }
+
+    // "1 km today! Your mouse went for a walk." -> headline "1 km today!" + the fun line
+    void NotifyMilestone(string text)
+    {
+        int cut = text.IndexOfAny(new[] { '!', '.' });
+        if (cut > 0 && cut < text.Length - 1) Notify(text.Substring(0, cut + 1), text.Substring(cut + 1).Trim(), null);
+        else Notify(text, "", null);
+    }
+
+    void FlushNotification()
+    {
+        if (queue.Count == 0 || Toast.Showing || Native.UserBusy()) return;
+        object[] n = queue[0];
+        queue.RemoveAt(0);
+        Toast.Pop((string)n[0], (string)n[1], (Action)n[2], FlushNotification);
     }
 
     // --- UI
@@ -1019,15 +1089,15 @@ class Popup : Form
         AutoScaleMode = AutoScaleMode.None;
         KeyPreview = true;
         using (Graphics g = CreateGraphics()) sc = g.DpiX / 96f;
-        ClientSize = new Size(S(320), S(386));
+        ClientSize = new Size(S(320), S(404));
 
         double now = stats().Today / 1000.0;
         fromKm = animate ? Math.Min(startKm, now) : now;
         shownKm = fromKm;
 
-        var share = new PillButton(pal, true, 10f) { Text = "Share my week", Bounds = new Rectangle(S(13), S(330), S(186), S(44)) };
+        var share = new PillButton(pal, true, 10f) { Text = "Share my week", Bounds = new Rectangle(S(13), S(348), S(186), S(44)) };
         share.Click += delegate { if (ShareClicked != null) ShareClicked(this, EventArgs.Empty); };
-        var screens = new PillButton(pal, false, 10f) { Text = "Screens", Bounds = new Rectangle(S(201), S(330), S(106), S(44)) };
+        var screens = new PillButton(pal, false, 10f) { Text = "Screens", Bounds = new Rectangle(S(201), S(348), S(106), S(44)) };
         screens.Click += delegate { if (SetupClicked != null) SetupClicked(this, EventArgs.Empty); };
         Controls.Add(share);
         Controls.Add(screens);
@@ -1097,7 +1167,7 @@ class Popup : Form
             shownKm += (target - shownKm) * 0.3; // the wheels keep creeping while you move
             if (Math.Abs(target - shownKm) < 0.0005) shownKm = target;
         }
-        Invalidate(new Rectangle(0, S(50), Width, S(270)));
+        Invalidate(new Rectangle(0, S(50), Width, S(290)));
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -1114,6 +1184,7 @@ class Popup : Form
         using (var small = Fonts.Ui(8.5f, FontStyle.Bold))
         using (var unit = Fonts.Ui(15f, FontStyle.Bold))
         using (var tile = Fonts.Ui(15f, FontStyle.Bold))
+        using (var caption = Fonts.Ui(8.5f, FontStyle.Regular))
         {
             TextRenderer.DrawText(g, "Today's trip", title, new Point(S(13), S(14)), pal.Content);
             TextRenderer.DrawText(g, DateTime.Now.ToString("ddd d MMM", Fun.CI), date,
@@ -1136,8 +1207,9 @@ class Popup : Form
             TextRenderer.DrawText(g, Fun.Dist(next - st.Today) + " to go", small,
                 new Rectangle(S(150), S(204), S(154), S(18)), pal.Secondary, TextFormatFlags.Right);
 
-            DrawTile(g, new RectangleF(S(16), S(238), S(140), S(76)), "THIS WEEK", Fun.Dist(st.Week), small, tile);
-            DrawTile(g, new RectangleF(S(164), S(238), S(140), S(76)), "ALL TIME", Fun.Dist(st.AllTime), small, tile);
+            DrawTile(g, new RectangleF(S(16), S(238), S(140), S(94)), "THIS WEEK", Fun.Dist(st.Week), "since Monday", small, tile, caption);
+            DrawTile(g, new RectangleF(S(164), S(238), S(140), S(94)), "LIFETIME", Fun.Dist(st.AllTime),
+                "since " + st.Since.ToString("d MMM yyyy", Fun.CI), small, tile, caption);
         }
     }
 
@@ -1169,7 +1241,7 @@ class Popup : Form
         g.Restore(state);
     }
 
-    void DrawTile(Graphics g, RectangleF r, string label, string value, Font small, Font big)
+    void DrawTile(Graphics g, RectangleF r, string label, string value, string note, Font small, Font big, Font noteFont)
     {
         using (var path = Art.Round(r, S(12)))
         {
@@ -1178,6 +1250,167 @@ class Popup : Form
         }
         TextRenderer.DrawText(g, label, small, new Point((int)r.X + S(12), (int)r.Y + S(12)), pal.Secondary);
         TextRenderer.DrawText(g, value, big, new Point((int)r.X + S(10), (int)r.Y + S(32)), pal.Content);
+        TextRenderer.DrawText(g, note, noteFont, new Point((int)r.X + S(12), (int)r.Y + S(64)), pal.Secondary);
+    }
+}
+
+// ---------------------------------------------------------------- milestone pop-up
+
+// Mouse Travel's own notification card. It works even when Windows notifications are off,
+// never takes keyboard focus, pauses while hovered, and dismisses on click or after 5 seconds.
+class Toast : Form
+{
+    static Toast current;
+    const double LifeMs = 5000, InMs = 200, OutMs = 180;
+    readonly Palette pal;
+    readonly float sc;
+    readonly bool animate;
+    readonly string title, message;
+    readonly Action onClick;
+    readonly System.Windows.Forms.Timer timer;
+    readonly int msgH;
+    double remaining = LifeMs;
+    DateTime shownAt, lastTick, fadeStart;
+    bool hover, closing, clicked;
+    int restLeft;
+
+    public static bool Showing { get { return current != null && !current.IsDisposed; } }
+
+    // afterClose runs once this card is gone, so the next queued one can follow.
+    public static void Pop(string title, string message, Action onClick, Action afterClose)
+    {
+        if (Showing) current.Close();
+        current = new Toast(title, message, onClick);
+        if (afterClose != null) current.FormClosed += delegate { current = null; afterClose(); };
+        current.ShowInCorner();
+    }
+
+    public Toast(string title, string message, Action onClick)
+    {
+        this.title = title;
+        this.message = message;
+        this.onClick = onClick;
+        pal = Palette.Current();
+        animate = !Native.ReducedMotion();
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        TopMost = true;
+        StartPosition = FormStartPosition.Manual;
+        BackColor = pal.Surface;
+        DoubleBuffered = true;
+        AutoScaleMode = AutoScaleMode.None;
+        Cursor = Cursors.Hand;
+        AccessibleName = title + ". " + message;
+        using (Graphics g = CreateGraphics()) sc = g.DpiX / 96f;
+
+        using (var f = Fonts.Ui(9.5f, FontStyle.Regular))
+            msgH = TextRenderer.MeasureText(message, f, new Size(TextWidth, 0), TextFormatFlags.WordBreak).Height;
+        ClientSize = new Size(S(360), Math.Max(S(80), S(16) + S(22) + msgH + S(18)));
+
+        timer = new System.Windows.Forms.Timer { Interval = 16 };
+        timer.Tick += delegate { Step(); };
+        MouseEnter += delegate { hover = true; };
+        MouseLeave += delegate { hover = false; };
+        MouseUp += (s, e) => { clicked = e.Button == MouseButtons.Left; Dismiss(); };
+    }
+
+    int S(float v) { return (int)Math.Round(v * sc); }
+    int TextWidth { get { return S(360) - S(72) - S(40); } }
+
+    protected override bool ShowWithoutActivation { get { return true; } }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= 0x08000000 | 0x80; // WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW: never steals focus, no Alt+Tab entry
+            cp.ClassStyle |= 0x20000;        // drop shadow
+            return cp;
+        }
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Native.RoundCorners(Handle);
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        timer.Stop();
+        timer.Dispose();
+        base.OnFormClosed(e);
+        if (clicked && onClick != null) onClick();
+    }
+
+    void ShowInCorner()
+    {
+        Rectangle wa = Screen.PrimaryScreen.WorkingArea; // the tray lives on the primary screen
+        restLeft = wa.Right - Width - S(12);
+        Location = new Point(restLeft + (animate ? S(24) : 0), wa.Bottom - Height - S(12));
+        if (animate) Opacity = 0;
+        shownAt = lastTick = DateTime.Now;
+        Show();
+        timer.Start();
+    }
+
+    void Dismiss()
+    {
+        if (closing) return;
+        closing = true;
+        fadeStart = DateTime.Now;
+        if (!animate) Close();
+    }
+
+    void Step()
+    {
+        DateTime now = DateTime.Now;
+        double dt = (now - lastTick).TotalMilliseconds, t = (now - shownAt).TotalMilliseconds;
+        lastTick = now;
+        if (closing)
+        {
+            double k = (now - fadeStart).TotalMilliseconds / OutMs;
+            if (k >= 1) { Close(); return; }
+            Opacity = 1 - k;
+            return;
+        }
+        if (animate && t < InMs)
+        {
+            double e = 1 - Math.Pow(1 - t / InMs, 3);
+            Opacity = e;
+            Left = restLeft + (int)Math.Round(S(24) * (1 - e));
+            return;
+        }
+        if (Left != restLeft) { Opacity = 1; Left = restLeft; }
+        if (!hover) remaining -= dt;
+        if (remaining <= 0) Dismiss();
+        if (animate) Invalidate(new Rectangle(0, Height - S(4), Width, S(4)));
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var pen = new Pen(pal.Hairline)) g.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
+
+        Art.DrawLogo(g, new RectangleF(S(16), (Height - S(44)) / 2f, S(44), S(44)));
+        using (var head = Fonts.Ui(10.5f, FontStyle.Bold))
+        using (var body = Fonts.Ui(9.5f, FontStyle.Regular))
+        using (var close = Fonts.Ui(11f, FontStyle.Regular))
+        {
+            TextRenderer.DrawText(g, title, head, new Rectangle(S(72), S(16), TextWidth, S(22)), pal.Content, TextFormatFlags.EndEllipsis);
+            TextRenderer.DrawText(g, message, body, new Rectangle(S(72), S(16) + S(22), TextWidth, msgH), pal.Secondary, TextFormatFlags.WordBreak);
+            TextRenderer.DrawText(g, "×", close, new Rectangle(Width - S(34), S(8), S(24), S(24)), pal.Secondary,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+        }
+        // a thin countdown line along the bottom edge
+        if (animate)
+        {
+            float frac = (float)Math.Max(0, Math.Min(1, remaining / LifeMs));
+            using (var b = new SolidBrush(pal.Dark ? pal.Accent : pal.AccentText))
+                g.FillRectangle(b, 0, Height - S(3), Width * frac, S(3));
+        }
     }
 }
 
@@ -1484,16 +1717,43 @@ static class Art
         g.Restore(state);
     }
 
-    // ---- icons
+    // ---- logo and icons
 
-    static Bitmap IconBitmap(int s)
+    // The logo ("lane driver"): the mouse driving right on a dark tile, lane dashes fading out behind it.
+    // The gap between dashes and mouse keeps it reading as motion rather than a cable.
+    // compact: for 24 px and below, a bigger mouse and a single dash so it still reads in the tray.
+    public static void DrawLogo(Graphics g, RectangleF t, bool compact = false)
+    {
+        var old = g.SmoothingMode;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        float u = t.Width, cy = t.Y + u * 0.5f;
+        using (var p = Round(t, u * 0.24f)) using (var b = new SolidBrush(Ink)) g.FillPath(b, p);
+        using (var dash = new Pen(Yellow, u * (compact ? 0.11f : 0.07f)) { StartCap = LineCap.Round, EndCap = LineCap.Round })
+        {
+            if (compact) g.DrawLine(dash, t.X + u * 0.16f, cy, t.X + u * 0.26f, cy);
+            else
+            {
+                g.DrawLine(dash, t.X + u * 0.30f, cy, t.X + u * 0.38f, cy);
+                dash.Color = Color.FromArgb(150, Yellow);
+                g.DrawLine(dash, t.X + u * 0.15f, cy, t.X + u * 0.20f, cy);
+            }
+        }
+        float mw = u * (compact ? 0.42f : 0.30f), mh = u * (compact ? 0.56f : 0.44f);
+        var state = g.Save();
+        g.TranslateTransform(t.X + u * (compact ? 0.60f : 0.64f), cy);
+        g.RotateTransform(90);
+        DrawMouse(g, new RectangleF(-mw / 2, -mh / 2, mw, mh), Yellow);
+        g.Restore(state);
+        g.SmoothingMode = old;
+    }
+
+    public static Bitmap IconBitmap(int s)
     {
         var bmp = new Bitmap(s, s, PixelFormat.Format32bppArgb);
         using (Graphics g = Graphics.FromImage(bmp))
         {
             g.Clear(Color.Transparent);
-            float w = s * 0.66f, h = s * 0.94f;
-            DrawMouse(g, new RectangleF((s - w) / 2, (s - h) / 2, w, h), Yellow);
+            DrawLogo(g, new RectangleF(0.5f, 0.5f, s - 1, s - 1), s <= 24);
         }
         return bmp;
     }
@@ -1572,7 +1832,8 @@ static class Art
             g.Clear(Palette.Hex(0x161616));
 
             string range = weekStart.ToString("d MMM", Fun.CI) + " – " + weekStart.AddDays(6).ToString("d MMM yyyy", Fun.CI);
-            g.DrawString("MOUSE TRAVEL · WEEKLY TRIP", fEyebrow, accent, 80, 80);
+            DrawLogo(g, new RectangleF(72, 70, 50, 50));
+            g.DrawString("MOUSE TRAVEL · WEEKLY TRIP", fEyebrow, accent, 128, 80);
             g.DrawString(range, fEyebrow, dim, new RectangleF(500, 80, 500, 40), right);
             g.DrawString(thisWeek ? "This week I drove my mouse" : "Last week I drove my mouse", fHead, white, 74, 140);
 
@@ -1638,6 +1899,25 @@ static class SelfTest
         sb.AppendLine("reduced motion: " + Native.ReducedMotion());
         File.WriteAllText(Path.Combine(outDir, "report.txt"), sb.ToString());
 
+        // the icon at its real sizes on a dark and a light taskbar
+        int[] sizes = { 256, 48, 32, 24, 16 };
+        using (var strip = new Bitmap(640, 560))
+        using (var g = Graphics.FromImage(strip))
+        {
+            g.Clear(Palette.Hex(0x202020));
+            using (var light = new SolidBrush(Palette.Hex(0xEEEEEC))) g.FillRectangle(light, 0, 280, 640, 280);
+            for (int row = 0; row < 2; row++)
+            {
+                int x = 12;
+                foreach (int s in sizes)
+                {
+                    using (var icon = Art.IconBitmap(s)) g.DrawImageUnscaled(icon, x, row * 280 + (280 - s) / 2);
+                    x += s + 28;
+                }
+            }
+            strip.Save(Path.Combine(outDir, "logo.png"), ImageFormat.Png);
+        }
+
         double[] days = { 820, 1430, 960, 2210, 1780, 310, 120 };
         using (var card = Art.MakeCard(days, Fun.WeekStart(DateTime.Now), 48210, true)) card.Save(Path.Combine(outDir, "card.png"), ImageFormat.Png);
 
@@ -1646,10 +1926,12 @@ static class SelfTest
             Palette.ForceDark = dark;
             string tag = dark ? "dark" : "light";
             // 1.456 km: the tenths wheel is caught mid-roll
-            using (var p = new Popup(delegate { return new Stats { Today = 1456, Week = 5230, AllTime = 48210 }; }, 1.456))
+            using (var p = new Popup(delegate { return new Stats { Today = 1456, Week = 5230, AllTime = 48210, Since = new DateTime(2026, 11, 2) }; }, 1.456))
                 Snap(p, Path.Combine(outDir, "popup-" + tag + ".png"));
             using (var f = new SetupForm(mons.ToArray(), true, false))
                 Snap(f, Path.Combine(outDir, "setup-" + tag + ".png"));
+            using (var t = new Toast("1 km today!", "Your mouse officially went for a walk.", null))
+                Snap(t, Path.Combine(outDir, "toast-" + tag + ".png"));
         }
     }
 

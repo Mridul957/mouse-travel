@@ -1,4 +1,6 @@
-# 🖱️ Mouse Travel
+<img src="docs/logo.png" width="96" alt="Mouse Travel logo">
+
+# Mouse Travel
 
 A tiny Windows tray app that turns your mouse movement into meters and kilometers, shown on a rolling car odometer.
 
@@ -8,11 +10,13 @@ A tiny Windows tray app that turns your mouse movement into meters and kilometer
 </p>
 
 - **Lives in the system tray:** a few MB of RAM, a single small `.exe`, no installer, no extra runtime
-- **A rolling odometer** for today's trip, plus a little road to your next milestone
-- **Milestone pop-ups** at 500 m and 1 km, then every km after that, plus all-time ones like "half marathon"
+- **A rolling odometer** for today's trip, a little road to your next milestone, and your **lifetime** distance
+- **Milestone pop-ups** at 500 m and 1 km, then every km after that, plus lifetime ones like "half marathon". They're Mouse Travel's own cards, so they work even with Windows notifications off, never steal focus, and wait while you're in a full-screen app.
 - **A weekly share card:** a 1080×1080 image saved to `Pictures\Mouse Travel` and copied to your clipboard
 - **Automatic screen detection** of each monitor's real size (adjust anytime under **Screens**)
 - Follows Windows **light/dark mode** and the **Animation effects** setting
+
+<img src="docs/toast-dark.png" width="380" alt="Milestone pop-up">
 
 <img src="docs/card.png" width="420" alt="Weekly share card">
 
@@ -22,8 +26,9 @@ Grab `MouseTravel.exe` from the [latest release](../../releases/latest) and doub
 Windows SmartScreen may warn you the first time because the app isn't code-signed. Click **More info → Run anyway**.
 
 ## Use it
-- **Left-click** the mint mouse in the tray to see today, this week and all-time totals
+- **Left-click** the little yellow mouse in the tray to see today, this week and lifetime totals
 - **Right-click** for share, screens, start with Windows, and quit
+- Hover over the tray icon for a quick "today · lifetime" readout
 
 The numbers are deliberately rough: it measures how far the cursor travels across your screens, using each screen's physical size.
 
