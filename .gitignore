@@ -5,3 +5,7 @@ src/*.ico
 
 # Local design-review renders
 screenshots-review/
+
+# Personal distance history written next to the exe
+Mouse Travel history.txt
+*.txt.tmp

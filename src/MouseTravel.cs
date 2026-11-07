@@ -261,19 +261,29 @@ class Store
         settingsPath = Path.Combine(Dir, "settings.ini");
     }
 
+    // A small diagnostics log (MouseTravel\log.txt), so a load or save problem leaves a trace.
+    public void Log(string msg)
+    {
+        try
+        {
+            Directory.CreateDirectory(Dir);
+            string path = Path.Combine(Dir, "log.txt");
+            if (File.Exists(path) && new FileInfo(path).Length > 200 * 1024) File.Delete(path);
+            File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", Fun.CI) + "  " + msg + "\r\n");
+        }
+        catch { }
+    }
+
     public void Load()
     {
         try
         {
-            if (File.Exists(dataPath))
-            {
-                foreach (string line in File.ReadAllLines(dataPath))
-                {
-                    string[] p = line.Split(',');
-                    double m;
-                    if (p.Length == 2 && double.TryParse(p[1], NumberStyles.Float, Fun.CI, out m)) days[p[0]] = m;
-                }
-            }
+            KeepAll(ReadCsv(dataPath));
+            int before = days.Count;
+            double totalBefore = Total();
+            KeepAll(ReadHistory(HistoryPath)); // restores days missing (or lower) in days.csv
+            if (days.Count > before || Total() > totalBefore + 1)
+                Log("restored from the history file: " + (days.Count - before) + " new day(s), +" + (Total() - totalBefore).ToString("0", Fun.CI) + " m");
             if (File.Exists(settingsPath))
             {
                 foreach (string line in File.ReadAllLines(settingsPath))
@@ -282,8 +292,10 @@ class Store
                     if (eq > 0) settings[line.Substring(0, eq)] = line.Substring(eq + 1);
                 }
             }
+            if (File.Exists(dataPath)) lastWritten = File.ReadAllText(dataPath);
+            Log("load: " + days.Count + " days, " + Total().ToString("0", Fun.CI) + " m (pid " + Process.GetCurrentProcess().Id + ")");
         }
-        catch { }
+        catch (Exception ex) { Log("load FAILED: " + ex); }
     }
 
     public void Save()
@@ -291,25 +303,140 @@ class Store
         try
         {
             Directory.CreateDirectory(Dir);
+            // Never write less than the files already hold: a day's distance only ever grows.
+            var onDisk = ReadCsv(dataPath);
+            if (lastWritten != null && File.Exists(dataPath) && File.ReadAllText(dataPath) != lastWritten)
+                Log("WARNING days.csv changed outside this app: " + File.ReadAllText(dataPath).Replace("\n", " | "));
+            KeepAll(onDisk);
+            KeepAll(ReadHistory(HistoryPath)); // the history file is shared by every copy of the app, so take its highs too
+            DailyBackup();
+
             var sb = new StringBuilder();
-            var keys = new List<string>(days.Keys);
-            keys.Sort(StringComparer.Ordinal);
-            foreach (string k in keys) sb.Append(k).Append(',').Append(days[k].ToString("0.###", Fun.CI)).Append('\n');
+            foreach (string k in SortedDays()) sb.Append(k).Append(',').Append(days[k].ToString("0.###", Fun.CI)).Append('\n');
             WriteAtomic(dataPath, sb.ToString());
+            lastWritten = sb.ToString();
+            Log("saved: " + days.Count + " days, " + Total().ToString("0", Fun.CI) + " m (pid " + Process.GetCurrentProcess().Id + ")");
 
             sb.Length = 0;
             foreach (var kv in settings) sb.Append(kv.Key).Append('=').Append(kv.Value).Append('\n');
             WriteAtomic(settingsPath, sb.ToString());
         }
+        catch (Exception ex) { Log("save FAILED: " + ex); }
+        WriteHistory();
+    }
+
+    string lastWritten;
+
+    // One copy of days.csv per day in MouseTravel\backup, keeping the last 7.
+    void DailyBackup()
+    {
+        try
+        {
+            if (!File.Exists(dataPath)) return;
+            string dir = Path.Combine(Dir, "backup");
+            Directory.CreateDirectory(dir);
+            string today = Path.Combine(dir, "days-" + Fun.DayKey(DateTime.Now) + ".csv");
+            if (File.Exists(today)) return;
+            File.Copy(dataPath, today);
+            var old = new List<string>(Directory.GetFiles(dir, "days-*.csv"));
+            old.Sort(StringComparer.Ordinal);
+            for (int i = 0; i < old.Count - 7; i++) File.Delete(old[i]);
+        }
+        catch (Exception ex) { Log("backup FAILED: " + ex.Message); }
+    }
+
+    List<string> SortedDays()
+    {
+        var keys = new List<string>(days.Keys);
+        keys.Sort(StringComparer.Ordinal);
+        return keys;
+    }
+
+    void KeepAll(Dictionary<string, double> found)
+    {
+        foreach (var kv in found)
+        {
+            double cur;
+            if (!days.TryGetValue(kv.Key, out cur) || kv.Value > cur) days[kv.Key] = kv.Value;
+        }
+    }
+
+    static Dictionary<string, double> ReadCsv(string path)
+    {
+        var d = new Dictionary<string, double>();
+        if (!File.Exists(path)) return d;
+        foreach (string line in File.ReadAllLines(path))
+        {
+            string[] p = line.Split(',');
+            double m;
+            if (p.Length == 2 && double.TryParse(p[1], NumberStyles.Float, Fun.CI, out m)) d[p[0]] = m;
+        }
+        return d;
+    }
+
+    // ---- the human-readable history next to MouseTravel.exe (also a backup the app reads back)
+
+    static string HistoryPath
+    {
+        get { return Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "Mouse Travel history.txt"); }
+    }
+
+    static readonly System.Text.RegularExpressions.Regex HistoryRow =
+        new System.Text.RegularExpressions.Regex(@"^(\d{4}-\d{2}-\d{2})\s+\w{3}\s+([\d.]+) m\s*$");
+
+    static Dictionary<string, double> ReadHistory(string path)
+    {
+        var d = new Dictionary<string, double>();
+        try
+        {
+            if (!File.Exists(path)) return d;
+            foreach (string line in File.ReadAllLines(path))
+            {
+                var m = HistoryRow.Match(line);
+                double v;
+                if (m.Success && double.TryParse(m.Groups[2].Value, NumberStyles.Float, Fun.CI, out v)) d[m.Groups[1].Value] = v;
+            }
+        }
         catch { }
+        return d;
+    }
+
+    void WriteHistory()
+    {
+        try
+        {
+            DateTime now = DateTime.Now;
+            double total = Total(), week = Range(Fun.WeekStart(now), now.Date.AddDays(1));
+            var sb = new StringBuilder();
+            sb.Append("MOUSE TRAVEL - distance history\r\n");
+            sb.Append("Updated " + now.ToString("ddd d MMM yyyy, HH:mm", Fun.CI) + "\r\n\r\n");
+            sb.Append("Lifetime    " + Fun.Dist(total) + "   (since " + FirstDay().ToString("d MMM yyyy", Fun.CI) + ")\r\n");
+            sb.Append("This week   " + Fun.Dist(week) + "\r\n\r\n");
+            sb.Append("Date        Day   Distance\r\n");
+            foreach (string k in SortedDays())
+            {
+                DateTime d;
+                string dow = DateTime.TryParseExact(k, "yyyy-MM-dd", Fun.CI, DateTimeStyles.None, out d) ? d.ToString("ddd", Fun.CI) : "   ";
+                sb.Append(k + "  " + dow + "   " + days[k].ToString("0.###", Fun.CI) + " m\r\n"); // exact, so merging never drifts
+            }
+            sb.Append("\r\nThis file is updated automatically. Mouse Travel also reads it back as a backup.\r\n");
+            WriteAtomic(HistoryPath, sb.ToString());
+        }
+        catch (Exception ex) { Log("history write FAILED: " + ex.Message); }
     }
 
     static void WriteAtomic(string path, string content)
     {
         string tmp = path + ".tmp";
         File.WriteAllText(tmp, content, new UTF8Encoding(false));
-        if (File.Exists(path)) File.Replace(tmp, path, null);
-        else File.Move(tmp, path);
+        if (!File.Exists(path)) { File.Move(tmp, path); return; }
+        try { File.Replace(tmp, path, null); }
+        catch
+        {
+            // fallback when an atomic swap isn't possible (a stale temp file, a scanner holding the file)
+            File.Copy(tmp, path, true);
+            File.Delete(tmp);
+        }
     }
 
     public double Get(DateTime day)
@@ -531,6 +658,8 @@ class TrayApp : ApplicationContext
         {
             if (store.GetS("setup.done", "") != "1") FirstRun();
             else CheckWeekly();
+            Flush(); // writes the history file right away on every start
+            store.Log("started: today " + todayKey + " = " + todayMeters.ToString("0", Fun.CI) + " m, lifetime " + allTime.ToString("0", Fun.CI) + " m");
             Native.TrimMemory();
         }));
     }
@@ -603,6 +732,9 @@ class TrayApp : ApplicationContext
     {
         store.Save();
         dirty = false;
+        // the save merges in anything already on disk; pick that up so totals never go backwards
+        todayMeters = Math.Max(todayMeters, store.Get(DateTime.Now));
+        allTime = Math.Max(allTime, store.Total());
     }
 
     void UpdateTooltip()
@@ -848,7 +980,11 @@ class TrayApp : ApplicationContext
         }));
     }
 
-    void OnSessionEnding(object sender, SessionEndingEventArgs e) { Flush(); }
+    void OnSessionEnding(object sender, SessionEndingEventArgs e)
+    {
+        Flush();
+        store.Log("saved at Windows " + e.Reason.ToString().ToLowerInvariant());
+    }
 
     void Quit()
     {

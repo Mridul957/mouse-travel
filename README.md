@@ -35,7 +35,12 @@ The numbers are deliberately rough: it measures how far the cursor travels acros
 <img src="docs/setup-dark.png" width="360" alt="Screens window">
 
 ## Your data
-Stored only on your PC in `%APPDATA%\MouseTravel` (`days.csv` holds one line per day). Nothing is sent anywhere. To back up your history, copy that folder.
+Stored only on your PC. Nothing is sent anywhere.
+
+- **`Mouse Travel history.txt`**, next to `MouseTravel.exe`: a plain notepad file with every day, this week and your lifetime total. It's refreshed every minute and on every start, and Mouse Travel reads it back as a backup.
+- **`%APPDATA%\MouseTravel`**: the app's own data (`days.csv`, one line per day), a `backup` folder with a copy for each of the last 7 days, and a small `log.txt`.
+
+Saving never lowers a day's distance: before writing, Mouse Travel merges what's already on disk and in the history file. To move or back up your history, copy the history file (or the AppData folder).
 
 ## Build from source
 Requires Windows 10 or 11, nothing else. This uses the C# compiler that ships with Windows (.NET Framework 4.x):
