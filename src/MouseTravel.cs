@@ -18,6 +18,15 @@ using System.Threading;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
+// Shown in Task Manager, file properties and Settings → Apps; also used to tell an update from a reinstall.
+[assembly: AssemblyTitle("Mouse Travel")]
+[assembly: AssemblyProduct("Mouse Travel")]
+[assembly: AssemblyDescription("Turns your mouse movement into kilometers")]
+[assembly: AssemblyCompany("Mridul957")]
+[assembly: AssemblyCopyright("MIT License")]
+[assembly: AssemblyVersion("1.4.0.0")]
+[assembly: AssemblyFileVersion("1.4.0.0")]
+
 static class Program
 {
     [STAThread]
@@ -42,12 +51,33 @@ static class Program
             SelfTest.Run(args[1]);
             return 0;
         }
+        if (args.Length >= 1 && args[0] == "--uninstall")
+        {
+            Installer.Uninstall(args.Length < 2 || args[1] != "--quiet");
+            return 0;
+        }
+        if (args.Length >= 1 && args[0] == "--install")
+        {
+            Installer.Install(args.Length < 2 || args[1] != "--quiet", true);
+            return 0;
+        }
+        if (args.Length == 1 && args[0] == "--enable-startup")
+        {
+            TrayApp.SetStartup(true);
+            return 0;
+        }
+        // Run from Downloads (or anywhere else)? Offer to install, update, or just open the installed copy.
+        if (args.Length == 0 && Installer.ShouldInstall())
+        {
+            Installer.FromDownload();
+            return 0;
+        }
 
         bool created;
         using (var mutex = new Mutex(true, "MouseTravel_SingleInstance", out created))
         {
             if (!created) return 0;
-            Application.Run(new TrayApp());
+            Application.Run(new TrayApp(args.Length == 1 && args[0] == "--updated"));
         }
         return 0;
     }
@@ -465,6 +495,8 @@ class Store
         get { return Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "Mouse Travel history.txt"); }
     }
 
+    public static string HistoryFile { get { return HistoryPath; } }
+
     static readonly System.Text.RegularExpressions.Regex HistoryRow =
         new System.Text.RegularExpressions.Regex(@"^(\d{4}-\d{2}-\d{2})\s+\w{3}\s+([\d.]+) m\s*$");
 
@@ -718,9 +750,10 @@ class TrayApp : ApplicationContext
     readonly List<object[]> queue = new List<object[]>(); // pending pop-ups: title, text, click action
     ToolStripMenuItem startupItem;
 
-    public TrayApp()
+    public TrayApp(bool justUpdated)
     {
         invoker.CreateControl(); // installs the UI sync context so system events land on this thread
+        ListenForQuit();
         RepairStartup();
         store.Load();
         allTime = store.Total();
@@ -742,6 +775,7 @@ class TrayApp : ApplicationContext
         menu.Items.Add(syncItem);
         menu.Items.Add(stopSyncItem);
         menu.Items.Add(weekIconItem);
+        menu.Items.Add("Open my history", null, delegate { try { Flush(); Process.Start(Store.HistoryFile); } catch { } });
         menu.Items.Add("Open data folder", null, delegate { try { Process.Start(store.Dir); } catch { } });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Quit", null, delegate { Quit(); });
@@ -773,6 +807,8 @@ class TrayApp : ApplicationContext
         {
             if (store.GetS("setup.done", "") != "1") FirstRun();
             else CheckWeekly();
+            if (justUpdated)
+                Notify("Updated to version " + Installer.MyVersion.ToString(3), "All set. Your distance history is right where you left it.", null);
             Flush(); // writes the history file right away on every start
             store.Log("started: today " + todayKey + " = " + todayMeters.ToString("0", Fun.CI) + " m, lifetime " + allTime.ToString("0", Fun.CI) + " m");
             Native.TrimMemory();
@@ -1140,28 +1176,34 @@ class TrayApp : ApplicationContext
         return File.Exists(ShortcutPath) && !Disabled(ApprovedFolderKey, ShortcutName);
     }
 
-    static void SetStartup(bool on)
+    public static void SetStartup(bool on) { SetStartup(on, Application.ExecutablePath); }
+
+    public static void SetStartup(bool on, string exe)
     {
         try
         {
-            if (on)
-            {
-                Type t = Type.GetTypeFromProgID("WScript.Shell");
-                object shell = Activator.CreateInstance(t);
-                object lnk = t.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { ShortcutPath });
-                Type lt = lnk.GetType();
-                lt.InvokeMember("TargetPath", BindingFlags.SetProperty, null, lnk, new object[] { Application.ExecutablePath });
-                lt.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, lnk, new object[] { Path.GetDirectoryName(Application.ExecutablePath) });
-                lt.InvokeMember("Description", BindingFlags.SetProperty, null, lnk, new object[] { "Mouse Travel" });
-                lt.InvokeMember("Save", BindingFlags.InvokeMethod, null, lnk, null);
-                Marshal.FinalReleaseComObject(lnk);
-                Marshal.FinalReleaseComObject(shell);
-            }
+            if (on) MakeShortcut(ShortcutPath, exe);
             else if (File.Exists(ShortcutPath)) File.Delete(ShortcutPath);
             DeleteValue(ApprovedFolderKey, ShortcutName);
         }
         catch { }
     }
+
+    public static void MakeShortcut(string lnkPath, string exe)
+    {
+        Type t = Type.GetTypeFromProgID("WScript.Shell");
+        object shell = Activator.CreateInstance(t);
+        object lnk = t.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell, new object[] { lnkPath });
+        Type lt = lnk.GetType();
+        lt.InvokeMember("TargetPath", BindingFlags.SetProperty, null, lnk, new object[] { exe });
+        lt.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, lnk, new object[] { Path.GetDirectoryName(exe) });
+        lt.InvokeMember("Description", BindingFlags.SetProperty, null, lnk, new object[] { "Mouse Travel" });
+        lt.InvokeMember("Save", BindingFlags.InvokeMethod, null, lnk, null);
+        Marshal.FinalReleaseComObject(lnk);
+        Marshal.FinalReleaseComObject(shell);
+    }
+
+    public static string StartupShortcut { get { return ShortcutPath; } }
 
     // Move older installs from the Run key to the Startup folder (unless switched off in Task Manager),
     // and keep the shortcut pointing at this .exe if it was moved.
@@ -1202,6 +1244,21 @@ class TrayApp : ApplicationContext
     {
         Flush();
         store.Log("saved at Windows " + e.Reason.ToString().ToLowerInvariant());
+    }
+
+    // An installer or uninstaller asks the running copy to save and close (so its .exe can be replaced).
+    public const string QuitSignalName = "MouseTravel_QuitSignal";
+
+    void ListenForQuit()
+    {
+        var signal = new EventWaitHandle(false, EventResetMode.AutoReset, QuitSignalName);
+        var t = new Thread(delegate()
+        {
+            signal.WaitOne();
+            try { invoker.BeginInvoke(new Action(Quit)); } catch { }
+        });
+        t.IsBackground = true;
+        t.Start();
     }
 
     void Quit()
@@ -2035,6 +2092,272 @@ class SetupForm : Form
     }
 }
 
+// ---------------------------------------------------------------- install / update / uninstall
+
+// Installs just for the current user (no admin): %LOCALAPPDATA%\Programs\Mouse Travel, a Start menu shortcut,
+// start with Windows, and an entry in Settings → Apps with Uninstall. Running a newer exe updates in place;
+// running the same version again just opens the app. Distance data lives in %APPDATA%\MouseTravel and is kept.
+static class Installer
+{
+    const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\MouseTravel";
+
+    public static string InstallDir
+    {
+        get { return Path.Combine(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs"), "Mouse Travel"); }
+    }
+
+    public static string InstalledExe { get { return Path.Combine(InstallDir, "MouseTravel.exe"); } }
+    static string StartMenuShortcut { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Mouse Travel.lnk"); } }
+    static string Self { get { return Application.ExecutablePath; } }
+    public static Version MyVersion { get { return Assembly.GetExecutingAssembly().GetName().Version; } }
+
+    static Version InstalledVersion()
+    {
+        try { return File.Exists(InstalledExe) ? new Version(FileVersionInfo.GetVersionInfo(InstalledExe).FileVersion) : null; }
+        catch { return new Version(0, 0); }
+    }
+
+    static bool IsInstalledCopy { get { return string.Equals(Path.GetFullPath(Self), Path.GetFullPath(InstalledExe), StringComparison.OrdinalIgnoreCase); } }
+
+    // Offer to install unless this is the installed copy or a developer/portable copy
+    // (inside a git checkout, or with a "portable.txt" file next to it).
+    public static bool ShouldInstall()
+    {
+        if (IsInstalledCopy) return false;
+        string dir = Path.GetDirectoryName(Self);
+        if (File.Exists(Path.Combine(dir, "portable.txt"))) return false;
+        for (var d = new DirectoryInfo(dir); d != null; d = d.Parent)
+            if (Directory.Exists(Path.Combine(d.FullName, ".git"))) return false;
+        return true;
+    }
+
+    // Double-clicked from Downloads: install, update, or (same or newer already installed) just open it.
+    public static void FromDownload()
+    {
+        Version have = InstalledVersion();
+        if (have != null && have >= MyVersion) { Launch(null); return; }
+        Install(true, false);
+    }
+
+    public static void Install(bool interactive, bool force)
+    {
+        Version have = InstalledVersion();
+        bool update = have != null;
+        bool startup = !update || File.Exists(TrayApp.StartupShortcut);
+        if (interactive)
+        {
+            var mode = update ? InstallForm.Mode.Update : InstallForm.Mode.Install;
+            using (var f = new InstallForm(mode, update ? have.ToString(3) : null, MyVersion.ToString(3), InstallDir, startup))
+            {
+                if (f.ShowDialog() != DialogResult.OK) return;
+                startup = f.Option;
+            }
+        }
+        try
+        {
+            StopOtherCopies();
+            Directory.CreateDirectory(InstallDir);
+            if (!IsInstalledCopy) CopyWithRetry(Self, InstalledExe);
+
+            // bring along the readable history from wherever it was run before (e.g. Downloads)
+            string oldHistory = Path.Combine(Path.GetDirectoryName(Self), "Mouse Travel history.txt");
+            string newHistory = Path.Combine(InstallDir, "Mouse Travel history.txt");
+            if (File.Exists(oldHistory) && !File.Exists(newHistory)) File.Copy(oldHistory, newHistory);
+
+            TrayApp.MakeShortcut(StartMenuShortcut, InstalledExe);
+            TrayApp.SetStartup(startup, InstalledExe);
+            Register();
+            Launch(update ? "--updated" : null);
+        }
+        catch (Exception ex)
+        {
+            if (interactive) MessageBox.Show("Mouse Travel couldn't be installed:\n\n" + ex.Message, "Mouse Travel", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    public static void Uninstall(bool interactive)
+    {
+        bool deleteData = false;
+        if (interactive)
+        {
+            using (var f = new InstallForm(InstallForm.Mode.Uninstall, null, MyVersion.ToString(3), InstallDir, false))
+            {
+                if (f.ShowDialog() != DialogResult.OK) return;
+                deleteData = f.Option;
+            }
+        }
+        StopOtherCopies();
+        try { if (File.Exists(StartMenuShortcut)) File.Delete(StartMenuShortcut); } catch { }
+        TrayApp.SetStartup(false);
+        try { Registry.CurrentUser.DeleteSubKeyTree(UninstallKey, false); } catch { }
+        if (deleteData)
+        {
+            try { Directory.Delete(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MouseTravel"), true); } catch { }
+        }
+        // the running exe can't delete its own folder, so a hidden cmd does it a moment after we exit
+        try
+        {
+            Process.Start(new ProcessStartInfo("cmd.exe", "/c ping 127.0.0.1 -n 3 > nul & rmdir /s /q \"" + InstallDir + "\"")
+            {
+                CreateNoWindow = true, UseShellExecute = false, WorkingDirectory = Path.GetTempPath(),
+            });
+        }
+        catch { }
+        if (interactive)
+            MessageBox.Show(deleteData ? "Mouse Travel has been uninstalled." : "Mouse Travel has been uninstalled. Your distance history is kept, in case you install it again.",
+                "Mouse Travel", MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+
+    // Ask any running Mouse Travel to save and quit; anything still running after a few seconds
+    // (an older version that doesn't listen) is closed so its file can be replaced.
+    static void StopOtherCopies()
+    {
+        EventWaitHandle signal;
+        if (EventWaitHandle.TryOpenExisting(TrayApp.QuitSignalName, out signal)) { signal.Set(); signal.Dispose(); }
+        DateTime until = DateTime.Now.AddSeconds(6);
+        while (DateTime.Now < until && Others().Count > 0) Thread.Sleep(150);
+        foreach (var p in Others()) { try { p.Kill(); p.WaitForExit(3000); } catch { } }
+    }
+
+    static List<Process> Others()
+    {
+        var list = new List<Process>();
+        int me = Process.GetCurrentProcess().Id;
+        foreach (var p in Process.GetProcessesByName("MouseTravel")) if (p.Id != me) list.Add(p);
+        return list;
+    }
+
+    static void CopyWithRetry(string from, string to)
+    {
+        for (int i = 0; ; i++)
+        {
+            try { File.Copy(from, to, true); return; }
+            catch (IOException) { if (i >= 20) throw; Thread.Sleep(250); }
+        }
+    }
+
+    static void Register()
+    {
+        using (var k = Registry.CurrentUser.CreateSubKey(UninstallKey))
+        {
+            k.SetValue("DisplayName", "Mouse Travel");
+            k.SetValue("DisplayVersion", MyVersion.ToString(3));
+            k.SetValue("Publisher", "Mridul957");
+            k.SetValue("DisplayIcon", InstalledExe + ",0");
+            k.SetValue("InstallLocation", InstallDir);
+            k.SetValue("UninstallString", "\"" + InstalledExe + "\" --uninstall");
+            k.SetValue("QuietUninstallString", "\"" + InstalledExe + "\" --uninstall --quiet");
+            k.SetValue("URLInfoAbout", "https://github.com/Mridul957/mouse-travel");
+            k.SetValue("InstallDate", DateTime.Now.ToString("yyyyMMdd", Fun.CI));
+            k.SetValue("EstimatedSize", (int)(new FileInfo(InstalledExe).Length / 1024) + 1, RegistryValueKind.DWord);
+            k.SetValue("NoModify", 1, RegistryValueKind.DWord);
+            k.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+        }
+    }
+
+    static void Launch(string arg)
+    {
+        try { Process.Start(new ProcessStartInfo(InstalledExe, arg ?? "") { WorkingDirectory = InstallDir, UseShellExecute = true }); }
+        catch { }
+    }
+}
+
+// The small Install / Update / Uninstall window, in the app's own style.
+class InstallForm : Form
+{
+    public enum Mode { Install, Update, Uninstall }
+    public bool Option { get { return toggle.Checked; } }
+
+    readonly Palette pal;
+    readonly float sc;
+    readonly Toggle toggle;
+    readonly string title, sub, body;
+    readonly int pad, width, bodyTop, bodyH;
+
+    public InstallForm(Mode mode, string fromVersion, string toVersion, string dir, bool optionDefault)
+    {
+        pal = Palette.Current();
+        Text = "Mouse Travel";
+        FormBorderStyle = FormBorderStyle.FixedSingle;
+        MaximizeBox = MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+        BackColor = pal.Surface;
+        ForeColor = pal.Content;
+        Font = Fonts.Ui(10f, FontStyle.Regular);
+        AutoScaleMode = AutoScaleMode.None;
+        DoubleBuffered = true;
+        Icon = Art.MakeTrayIcon();
+        using (Graphics g = CreateGraphics()) sc = g.DpiX / 96f;
+        pad = S(28);
+        width = S(460);
+
+        string option, button;
+        if (mode == Mode.Install)
+        {
+            title = "Install Mouse Travel";
+            sub = "Version " + toVersion;
+            body = "Turns your mouse movement into kilometers, right from your taskbar. It installs just for you (no admin needed) and adds itself to the Start menu.\n\nInstall folder: " + dir;
+            option = "Start Mouse Travel with Windows";
+            button = "Install";
+        }
+        else if (mode == Mode.Update)
+        {
+            title = "Update Mouse Travel";
+            sub = "Version " + fromVersion + " → " + toVersion;
+            body = "Your distance history and settings are kept. Mouse Travel restarts on its own when it's done.";
+            option = "Start Mouse Travel with Windows";
+            button = "Update";
+        }
+        else
+        {
+            title = "Uninstall Mouse Travel";
+            sub = "Version " + toVersion;
+            body = "Removes the app, its Start menu entry and starting with Windows. Your distance history stays on this PC unless you choose to delete it.";
+            option = "Also delete my distance history";
+            button = "Uninstall";
+        }
+
+        int y = pad + S(64) + S(16);
+        bodyTop = y;
+        bodyH = TextRenderer.MeasureText(body, Font, new Size(width - 2 * pad, 0), TextFormatFlags.WordBreak).Height;
+        y += bodyH + S(18);
+
+        toggle = new Toggle(pal, sc) { Text = option, Checked = optionDefault, Bounds = new Rectangle(pad - S(3), y, width - 2 * pad, S(32)) };
+        Controls.Add(toggle);
+        y += S(32) + S(24);
+
+        var ok = new PillButton(pal, true, 10f) { Text = button, DialogResult = DialogResult.OK, Bounds = new Rectangle(width - pad - S(140) + S(3), y, S(140), S(44)) };
+        var cancel = new PillButton(pal, false, 10f) { Text = "Cancel", DialogResult = DialogResult.Cancel, Bounds = new Rectangle(ok.Left - S(104), y, S(100), S(44)) };
+        Controls.Add(cancel);
+        Controls.Add(ok);
+        AcceptButton = ok;
+        CancelButton = cancel;
+        ClientSize = new Size(width, y + S(44) + pad);
+    }
+
+    int S(float v) { return (int)Math.Round(v * sc); }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        Native.DarkTitleBar(Handle, pal.Dark);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        Art.DrawLogo(g, new RectangleF(pad, pad, S(64), S(64)));
+        using (var t = Fonts.Ui(16f, FontStyle.Bold))
+        using (var s = Fonts.Ui(9.5f, FontStyle.Regular))
+        {
+            TextRenderer.DrawText(g, title, t, new Point(pad + S(80), pad + S(6)), pal.Content);
+            TextRenderer.DrawText(g, sub, s, new Point(pad + S(82), pad + S(38)), pal.Secondary);
+        }
+        TextRenderer.DrawText(g, body, Font, new Rectangle(pad, bodyTop, width - 2 * pad, bodyH), pal.Secondary, TextFormatFlags.WordBreak);
+    }
+}
+
 // ---------------------------------------------------------------- drawing
 
 static class Art
@@ -2458,6 +2781,10 @@ static class SelfTest
                 Snap(f, Path.Combine(outDir, "setup-" + tag + ".png"));
             using (var t = new Toast("1 km today!", "Your mouse officially went for a walk.", null))
                 Snap(t, Path.Combine(outDir, "toast-" + tag + ".png"));
+            using (var f = new InstallForm(InstallForm.Mode.Install, null, "1.4.0", Installer.InstallDir, true))
+                Snap(f, Path.Combine(outDir, "install-" + tag + ".png"));
+            using (var f = new InstallForm(InstallForm.Mode.Update, "1.3.0", "1.4.0", Installer.InstallDir, true))
+                Snap(f, Path.Combine(outDir, "update-" + tag + ".png"));
         }
     }
 

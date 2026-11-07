@@ -22,8 +22,15 @@ A tiny Windows tray app that turns your mouse movement into meters and kilometer
 
 <img src="docs/card.png" width="420" alt="Weekly share card">
 
-## Download
-Grab `MouseTravel.exe` from the [latest release](../../releases/latest) and double-click it. That's it.
+## Download and install
+1. Download **[MouseTravel.exe](https://github.com/Mridul957/mouse-travel/releases/latest/download/MouseTravel.exe)** (the latest release).
+2. Double-click it and press **Install**. No admin password is needed.
+
+It installs just for you into `%LOCALAPPDATA%\Programs\Mouse Travel`, adds itself to the **Start menu**, starts with Windows (optional), and appears in **Settings → Apps** with an **Uninstall** button. You can delete the downloaded file afterwards.
+
+- **Updating:** download a newer `MouseTravel.exe` and double-click it. It updates in place and keeps your history.
+- **Uninstalling:** Settings → Apps → Mouse Travel → Uninstall. Your history is kept unless you choose to delete it.
+- **Portable use:** put a file called `portable.txt` next to the exe and it runs from where it is, without installing.
 
 Windows SmartScreen may warn you the first time because the app isn't code-signed. Click **More info → Run anyway**.
 
