@@ -5,6 +5,18 @@
 A tiny Windows tray app that turns your mouse movement into meters and kilometers, shown on a rolling car odometer.
 
 <p>
+  <a href="https://github.com/Mridul957/mouse-travel/releases/latest/download/MouseTravel.exe"><img src="https://img.shields.io/badge/Download%20for%20Windows-MouseTravel.exe-FFC93C?style=for-the-badge&logo=windows&logoColor=161616&labelColor=FFC93C" alt="Download for Windows" height="44"></a>
+</p>
+
+<p>
+  <a href="https://github.com/Mridul957/mouse-travel/releases/latest"><img src="https://img.shields.io/github/v/release/Mridul957/mouse-travel?label=latest&color=161616" alt="Latest version"></a>
+  <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-161616" alt="Windows 10 and 11">
+  <img src="https://img.shields.io/badge/size-under%20100%20KB-161616" alt="Under 100 KB">
+</p>
+
+**Download → double-click → Install.** That's it. ([what happens when you install](#download-and-install))
+
+<p>
   <img src="docs/popup-dark.png" width="260" alt="Today's trip popup, dark mode">
   <img src="docs/popup-light.png" width="260" alt="Today's trip popup, light mode">
 </p>
