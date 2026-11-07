@@ -10,7 +10,9 @@ A tiny Windows tray app that turns your mouse movement into meters and kilometer
 </p>
 
 - **Lives in the system tray:** a few MB of RAM, a single small `.exe`, no installer, no extra runtime
-- **A rolling odometer** for today's trip, a little road to your next milestone, and your **lifetime** distance
+- **A rolling odometer** for today's trip and a little road to your next milestone
+- **A Screen Time-style week:** Mon–Sun bars, your daily average with a dashed avg line, and how you compare to last week, plus your **lifetime** distance
+- **Sync across PCs:** point each PC at the same Google Drive or OneDrive folder and Today, Week and Lifetime add up all your computers (each PC writes only its own file, so there are no sync conflicts)
 - **Milestone pop-ups** at 500 m and 1 km, then every km after that, plus lifetime ones like "half marathon". They're Mouse Travel's own cards, so they work even with Windows notifications off, never steal focus, and wait while you're in a full-screen app.
 - **A weekly share card:** a 1080×1080 image saved to `Pictures\Mouse Travel` and copied to your clipboard
 - **Automatic screen detection** of each monitor's real size (adjust anytime under **Screens**)
@@ -26,9 +28,11 @@ Grab `MouseTravel.exe` from the [latest release](../../releases/latest) and doub
 Windows SmartScreen may warn you the first time because the app isn't code-signed. Click **More info → Run anyway**.
 
 ## Use it
-- **Left-click** the little yellow mouse in the tray to see today, this week and lifetime totals
-- **Right-click** for share, screens, start with Windows, and quit
-- Hover over the tray icon for a quick "today · lifetime" readout
+- **Left-click** the yellow lane-driver logo in the tray to see today, the week chart and your lifetime
+- **Hover** over it for Today, This week and Lifetime at a glance
+- **Right-click** for share, screens, start with Windows, sync across PCs, showing this week's km on the icon, and quit
+
+A full illustrated guide is in [How Mouse Travel works.pdf](How%20Mouse%20Travel%20works.pdf).
 
 The numbers are deliberately rough: it measures how far the cursor travels across your screens, using each screen's physical size.
 

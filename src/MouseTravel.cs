@@ -185,6 +185,7 @@ static class Native
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
     [DllImport("psapi.dll")] static extern bool EmptyWorkingSet(IntPtr process);
     [DllImport("shell32.dll")] static extern int SHQueryUserNotificationState(out int state);
+    [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr icon);
 
     // True while a full-screen app, presentation or the lock screen is up: hold pop-ups until it ends.
     public static bool UserBusy()
@@ -309,20 +310,103 @@ class Store
                 Log("WARNING days.csv changed outside this app: " + File.ReadAllText(dataPath).Replace("\n", " | "));
             KeepAll(onDisk);
             KeepAll(ReadHistory(HistoryPath)); // the history file is shared by every copy of the app, so take its highs too
+            if (SyncFolder != null) KeepAll(ReadCsv(MySyncFile)); // this PC's synced copy restores a reset PC
             DailyBackup();
 
-            var sb = new StringBuilder();
-            foreach (string k in SortedDays()) sb.Append(k).Append(',').Append(days[k].ToString("0.###", Fun.CI)).Append('\n');
-            WriteAtomic(dataPath, sb.ToString());
-            lastWritten = sb.ToString();
+            string csv = CsvText();
+            WriteAtomic(dataPath, csv);
+            lastWritten = csv;
             Log("saved: " + days.Count + " days, " + Total().ToString("0", Fun.CI) + " m (pid " + Process.GetCurrentProcess().Id + ")");
 
-            sb.Length = 0;
+            var sb = new StringBuilder();
             foreach (var kv in settings) sb.Append(kv.Key).Append('=').Append(kv.Value).Append('\n');
             WriteAtomic(settingsPath, sb.ToString());
         }
         catch (Exception ex) { Log("save FAILED: " + ex); }
+        SyncExchange();
         WriteHistory();
+    }
+
+    string CsvText()
+    {
+        var sb = new StringBuilder();
+        foreach (string k in SortedDays()) sb.Append(k).Append(',').Append(days[k].ToString("0.###", Fun.CI)).Append('\n');
+        return sb.ToString();
+    }
+
+    // ---- sync across PCs: each PC writes only its own <PC name>.csv into a cloud-synced folder
+    // (Google Drive, OneDrive...) and reads everyone else's. One writer per file means no sync conflicts.
+
+    public static string PcName { get { return Environment.MachineName; } }
+
+    // the "Mouse Travel" folder inside the folder the user picked, or null when sync is off
+    public string SyncFolder
+    {
+        get { string s = GetS("sync.dir", ""); return s == "" ? null : Path.Combine(s, "Mouse Travel"); }
+    }
+
+    string MySyncFile { get { return Path.Combine(SyncFolder, PcName + ".csv"); } }
+
+    readonly Dictionary<string, Dictionary<string, double>> others = new Dictionary<string, Dictionary<string, double>>();
+
+    public List<string> OtherPcs { get { return new List<string>(others.Keys); } }
+
+    public void SyncExchange()
+    {
+        others.Clear();
+        string dir = SyncFolder;
+        if (dir == null) return;
+        try
+        {
+            Directory.CreateDirectory(dir);
+            WriteAtomic(MySyncFile, CsvText());
+            foreach (string f in Directory.GetFiles(dir, "*.csv"))
+            {
+                string pc = Path.GetFileNameWithoutExtension(f);
+                if (!pc.Equals(PcName, StringComparison.OrdinalIgnoreCase)) others[pc] = ReadCsv(f);
+            }
+        }
+        catch (Exception ex) { Log("sync FAILED: " + ex.Message); }
+    }
+
+    public double OtherGet(DateTime day)
+    {
+        double sum = 0, m;
+        string k = Fun.DayKey(day);
+        foreach (var pc in others.Values) if (pc.TryGetValue(k, out m)) sum += m;
+        return sum;
+    }
+
+    public double OtherRange(DateTime from, DateTime toExclusive)
+    {
+        double sum = 0;
+        for (DateTime d = from.Date; d < toExclusive.Date; d = d.AddDays(1)) sum += OtherGet(d);
+        return sum;
+    }
+
+    public double OtherTotal()
+    {
+        double sum = 0;
+        foreach (var pc in others.Values) foreach (double m in pc.Values) sum += m;
+        return sum;
+    }
+
+    public double PcTotal(string pc)
+    {
+        double sum = 0;
+        Dictionary<string, double> d;
+        if (others.TryGetValue(pc, out d)) foreach (double m in d.Values) sum += m;
+        return sum;
+    }
+
+    // when counting started on any PC
+    public DateTime FirstDayAll()
+    {
+        DateTime first = FirstDay(), d;
+        foreach (var pc in others.Values)
+            foreach (string k in pc.Keys)
+                if (DateTime.TryParseExact(k, "yyyy-MM-dd", Fun.CI, DateTimeStyles.None, out d) && d < first) first = d;
+        return first;
     }
 
     string lastWritten;
@@ -406,12 +490,26 @@ class Store
         try
         {
             DateTime now = DateTime.Now;
-            double total = Total(), week = Range(Fun.WeekStart(now), now.Date.AddDays(1));
+            DateTime ws = Fun.WeekStart(now), end = now.Date.AddDays(1);
+            var pcs = OtherPcs;
             var sb = new StringBuilder();
             sb.Append("MOUSE TRAVEL - distance history\r\n");
             sb.Append("Updated " + now.ToString("ddd d MMM yyyy, HH:mm", Fun.CI) + "\r\n\r\n");
-            sb.Append("Lifetime    " + Fun.Dist(total) + "   (since " + FirstDay().ToString("d MMM yyyy", Fun.CI) + ")\r\n");
-            sb.Append("This week   " + Fun.Dist(week) + "\r\n\r\n");
+            if (pcs.Count == 0)
+            {
+                sb.Append("Lifetime    " + Fun.Dist(Total()) + "   (since " + FirstDay().ToString("d MMM yyyy", Fun.CI) + ")\r\n");
+                sb.Append("This week   " + Fun.Dist(Range(ws, end)) + "\r\n\r\n");
+            }
+            else
+            {
+                sb.Append("Lifetime, all PCs    " + Fun.Dist(Total() + OtherTotal()) + "   (since " + FirstDayAll().ToString("d MMM yyyy", Fun.CI) + ")\r\n");
+                sb.Append("This week, all PCs   " + Fun.Dist(Range(ws, end) + OtherRange(ws, end)) + "\r\n\r\n");
+                sb.Append("  " + PcName + " (this PC)   " + Fun.Dist(Total()) + "\r\n");
+                pcs.Sort(StringComparer.OrdinalIgnoreCase);
+                foreach (string pc in pcs) sb.Append("  " + pc + "   " + Fun.Dist(PcTotal(pc)) + "\r\n");
+                sb.Append("\r\nSynced through: " + SyncFolder + "\r\n\r\n");
+            }
+            sb.Append("This PC, day by day\r\n");
             sb.Append("Date        Day   Distance\r\n");
             foreach (string k in SortedDays())
             {
@@ -592,6 +690,10 @@ class Stats
 {
     public double Today, Week, AllTime;
     public DateTime Since = DateTime.Now.Date;
+    public int Pcs = 1; // how many PCs these numbers add up
+    public double[] WeekDays = new double[7]; // Mon..Sun of this week
+    public double LastWeek;                   // last week's total, for the "% from last week" line
+    public int DaysSoFar = 7;                 // days of this week up to and including today
 }
 
 class TrayApp : ApplicationContext
@@ -634,10 +736,23 @@ class TrayApp : ApplicationContext
         menu.Items.Add("Screens…", null, delegate { ShowSetup(false); });
         startupItem = new ToolStripMenuItem("Start with Windows", null, delegate { SetStartup(!IsStartup()); });
         menu.Items.Add(startupItem);
+        var syncItem = new ToolStripMenuItem("Sync across PCs…", null, delegate { ChooseSyncFolder(); });
+        var stopSyncItem = new ToolStripMenuItem("Stop syncing", null, delegate { StopSync(); });
+        var weekIconItem = new ToolStripMenuItem("Show this week's km on the icon", null, delegate { ToggleWeekOnIcon(); });
+        menu.Items.Add(syncItem);
+        menu.Items.Add(stopSyncItem);
+        menu.Items.Add(weekIconItem);
         menu.Items.Add("Open data folder", null, delegate { try { Process.Start(store.Dir); } catch { } });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Quit", null, delegate { Quit(); });
-        menu.Opening += delegate { startupItem.Checked = IsStartup(); };
+        menu.Opening += delegate
+        {
+            startupItem.Checked = IsStartup();
+            syncItem.Checked = store.SyncFolder != null;
+            syncItem.ToolTipText = store.SyncFolder ?? "Add up your distance across all your PCs";
+            stopSyncItem.Visible = store.SyncFolder != null;
+            weekIconItem.Checked = ShowWeekOnIcon;
+        };
 
         tray = new NotifyIcon { Icon = Art.MakeTrayIcon(), ContextMenuStrip = menu, Visible = true, Text = "Mouse Travel" };
         tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left) ShowPopup(); };
@@ -739,16 +854,73 @@ class TrayApp : ApplicationContext
 
     void UpdateTooltip()
     {
-        if (tray != null) tray.Text = "Mouse Travel \u00B7 today " + Fun.Dist(todayMeters) + " \u00B7 lifetime " + Fun.Dist(allTime);
+        if (tray == null) return;
+        Stats st = GetStats();
+        string s = "Mouse Travel\nToday " + Fun.Dist(st.Today) + "\nThis week " + Fun.Dist(st.Week) +
+                   "\nLifetime " + Fun.Dist(st.AllTime) + (st.Pcs > 1 ? " \u00B7 " + st.Pcs + " PCs" : "");
+        tray.Text = s.Length > 63 ? s.Substring(0, 63) : s; // Windows Forms caps tray tooltips at 63 characters
+        UpdateTrayIcon(st.Week);
+    }
+
+    // The tray icon shows this week's km (e.g. "5.2"), or the logo if that's switched off.
+    string trayLabel;
+    IntPtr trayHicon;
+
+    bool ShowWeekOnIcon { get { return store.GetS("tray.week", "0") == "1"; } } // logo by default
+
+    void UpdateTrayIcon(double weekMeters)
+    {
+        string label = ShowWeekOnIcon ? Art.WeekLabel(weekMeters) : "";
+        bool light = Art.TaskbarLight();
+        string key = label + (light ? "|light" : "|dark"); // redraw when the number or the taskbar theme changes
+        if (key == trayLabel) return;
+        trayLabel = key;
+        IntPtr old = trayHicon;
+        if (label == "")
+        {
+            tray.Icon = Art.MakeTrayIcon();
+            trayHicon = IntPtr.Zero;
+        }
+        else
+        {
+            using (var bmp = Art.NumberIcon(label, Art.TrayIconSize(), light))
+            {
+                trayHicon = bmp.GetHicon();
+                tray.Icon = Icon.FromHandle(trayHicon);
+            }
+        }
+        if (old != IntPtr.Zero) Native.DestroyIcon(old);
+    }
+
+    void ToggleWeekOnIcon()
+    {
+        store.SetS("tray.week", ShowWeekOnIcon ? "0" : "1"); // remembered either way
+        dirty = true;
+        UpdateTooltip();
     }
 
     Stats GetStats()
     {
+        // This PC live, plus whatever the other PCs last synced (Today/Week/Lifetime are "you", not one PC)
+        DateTime now = DateTime.Now, ws = Fun.WeekStart(now), end = now.Date.AddDays(1);
         return new Stats
         {
-            Today = todayMeters, Week = store.Range(Fun.WeekStart(DateTime.Now), DateTime.Now.Date.AddDays(1)),
-            AllTime = allTime, Since = store.FirstDay(),
+            Today = todayMeters + store.OtherGet(now),
+            Week = store.Range(ws, end) + store.OtherRange(ws, end),
+            AllTime = allTime + store.OtherTotal(),
+            Since = store.FirstDayAll(),
+            Pcs = 1 + store.OtherPcs.Count,
+            WeekDays = WeekDays(ws),
+            LastWeek = store.Range(ws.AddDays(-7), ws) + store.OtherRange(ws.AddDays(-7), ws),
+            DaysSoFar = (now.Date - ws).Days + 1,
         };
+    }
+
+    double[] WeekDays(DateTime weekStart)
+    {
+        var d = new double[7];
+        for (int i = 0; i < 7; i++) d[i] = store.Get(weekStart.AddDays(i)) + store.OtherGet(weekStart.AddDays(i));
+        return d;
     }
 
     void CheckWeekly()
@@ -863,7 +1035,7 @@ class TrayApp : ApplicationContext
     void ShareWeek(DateTime weekStart, bool thisWeek)
     {
         var days = new double[7];
-        for (int i = 0; i < 7; i++) days[i] = store.Get(weekStart.AddDays(i));
+        for (int i = 0; i < 7; i++) days[i] = store.Get(weekStart.AddDays(i)) + store.OtherGet(weekStart.AddDays(i));
         double total = 0;
         foreach (double d in days) total += d;
         try
@@ -871,7 +1043,7 @@ class TrayApp : ApplicationContext
             string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "Mouse Travel");
             Directory.CreateDirectory(dir);
             string path = Path.Combine(dir, "mouse-travel-week-" + Fun.DayKey(weekStart) + ".png");
-            using (Bitmap card = Art.MakeCard(days, weekStart, allTime, thisWeek))
+            using (Bitmap card = Art.MakeCard(days, weekStart, allTime + store.OtherTotal(), thisWeek))
             {
                 card.Save(path, ImageFormat.Png);
                 var data = new DataObject();
@@ -886,6 +1058,52 @@ class TrayApp : ApplicationContext
         {
             Notify("Couldn't make the card", ex.Message, null);
         }
+    }
+
+    // --- sync across PCs
+    void ChooseSyncFolder()
+    {
+        using (var dlg = new FolderBrowserDialog())
+        {
+            dlg.Description = "Pick a folder that syncs between your PCs, like Google Drive or OneDrive. " +
+                              "Each PC keeps its own small file in a \"Mouse Travel\" folder there, and your totals add them all up.";
+            dlg.ShowNewFolderButton = true;
+            string cur = store.GetS("sync.dir", "");
+            dlg.SelectedPath = cur != "" ? cur : SuggestedSyncDir();
+            if (dlg.ShowDialog() != DialogResult.OK) return;
+            store.SetS("sync.dir", dlg.SelectedPath);
+            Flush();
+            var pcs = store.OtherPcs;
+            Notify("Syncing across PCs",
+                pcs.Count > 0
+                    ? "Found " + string.Join(", ", pcs.ToArray()) + ". Your totals now add up every PC."
+                    : "This PC now saves to " + store.SyncFolder + ". Pick the same folder on your other PCs.",
+                null);
+        }
+    }
+
+    void StopSync()
+    {
+        store.SetS("sync.dir", "");
+        Flush();
+        Notify("Stopped syncing", "Totals show this PC only again. Your synced files are left where they are.", null);
+    }
+
+    // Google Drive's "My Drive" on any drive letter, else OneDrive, else Documents
+    static string SuggestedSyncDir()
+    {
+        try
+        {
+            foreach (var drive in DriveInfo.GetDrives())
+            {
+                string p = Path.Combine(drive.Name, "My Drive");
+                if (drive.IsReady && Directory.Exists(p)) return p;
+            }
+        }
+        catch { }
+        string od = Environment.GetEnvironmentVariable("OneDrive");
+        if (!string.IsNullOrEmpty(od) && Directory.Exists(od)) return od;
+        return Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
     }
 
     // --- system
@@ -1225,15 +1443,15 @@ class Popup : Form
         AutoScaleMode = AutoScaleMode.None;
         KeyPreview = true;
         using (Graphics g = CreateGraphics()) sc = g.DpiX / 96f;
-        ClientSize = new Size(S(320), S(404));
+        ClientSize = new Size(S(320), S(562));
 
         double now = stats().Today / 1000.0;
         fromKm = animate ? Math.Min(startKm, now) : now;
         shownKm = fromKm;
 
-        var share = new PillButton(pal, true, 10f) { Text = "Share my week", Bounds = new Rectangle(S(13), S(348), S(186), S(44)) };
+        var share = new PillButton(pal, true, 10f) { Text = "Share my week", Bounds = new Rectangle(S(13), S(506), S(186), S(44)) };
         share.Click += delegate { if (ShareClicked != null) ShareClicked(this, EventArgs.Empty); };
-        var screens = new PillButton(pal, false, 10f) { Text = "Screens", Bounds = new Rectangle(S(201), S(348), S(106), S(44)) };
+        var screens = new PillButton(pal, false, 10f) { Text = "Screens", Bounds = new Rectangle(S(201), S(506), S(106), S(44)) };
         screens.Click += delegate { if (SetupClicked != null) SetupClicked(this, EventArgs.Empty); };
         Controls.Add(share);
         Controls.Add(screens);
@@ -1303,7 +1521,7 @@ class Popup : Form
             shownKm += (target - shownKm) * 0.3; // the wheels keep creeping while you move
             if (Math.Abs(target - shownKm) < 0.0005) shownKm = target;
         }
-        Invalidate(new Rectangle(0, S(50), Width, S(290)));
+        Invalidate(new Rectangle(0, S(50), Width, S(450)));
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -1343,10 +1561,94 @@ class Popup : Form
             TextRenderer.DrawText(g, Fun.Dist(next - st.Today) + " to go", small,
                 new Rectangle(S(150), S(204), S(154), S(18)), pal.Secondary, TextFormatFlags.Right);
 
-            DrawTile(g, new RectangleF(S(16), S(238), S(140), S(94)), "THIS WEEK", Fun.Dist(st.Week), "since Monday", small, tile, caption);
-            DrawTile(g, new RectangleF(S(164), S(238), S(140), S(94)), "LIFETIME", Fun.Dist(st.AllTime),
-                "since " + st.Since.ToString("d MMM yyyy", Fun.CI), small, tile, caption);
+            DrawWeek(g, new RectangleF(S(16), S(238), S(288), S(196)), st, small, tile, caption);
+            DrawLifetime(g, new RectangleF(S(16), S(442), S(288), S(52)), st, small, tile, caption);
         }
+    }
+
+    void Card(Graphics g, RectangleF r)
+    {
+        using (var path = Art.Round(r, S(12)))
+        {
+            using (var b = new SolidBrush(pal.Raised)) g.FillPath(b, path);
+            if (!pal.Dark) using (var p = new Pen(pal.Hairline)) g.DrawPath(p, path);
+        }
+    }
+
+    // Screen Time-style week: total, daily average vs last week, then Mon..Sun bars with a dashed average line.
+    void DrawWeek(Graphics g, RectangleF r, Stats st, Font small, Font big, Font note)
+    {
+        Card(g, r);
+        int x0 = (int)r.X + S(12), right = (int)r.Right - S(12);
+        TextRenderer.DrawText(g, "THIS WEEK", small, new Point(x0, (int)r.Y + S(12)), pal.Secondary);
+        double avg = st.Week / Math.Max(1, st.DaysSoFar);
+        if (st.LastWeek > 0)
+        {
+            double pct = Math.Round((avg - st.LastWeek / 7) / (st.LastWeek / 7) * 100);
+            string trend = (pct >= 0 ? "↑ " : "↓ ") + Math.Abs(pct).ToString("0", Fun.CI) + "% from last week";
+            TextRenderer.DrawText(g, trend, note, new Rectangle(x0, (int)r.Y + S(12), right - x0, S(18)), pal.Secondary, TextFormatFlags.Right);
+        }
+        TextRenderer.DrawText(g, Fun.Dist(st.Week), big, new Point(x0 - S(2), (int)r.Y + S(30)), pal.Content);
+        TextRenderer.DrawText(g, Fun.Dist(avg) + " a day on average", note, new Point(x0, (int)r.Y + S(60)), pal.Secondary);
+
+        // chart area, with room on the right for the scale labels
+        float top = r.Y + S(88), bottom = r.Y + S(160), left = x0, chartRight = right - S(34);
+        double max = 0;
+        foreach (double d in st.WeekDays) max = Math.Max(max, d);
+        max = Math.Max(max, avg);
+        double step = max < 1000 ? 100 : 500, scale = Math.Max(step, Math.Ceiling(max / step) * step);
+
+        using (var grid = new Pen(pal.Hairline))
+        {
+            g.DrawLine(grid, left, top, chartRight, top);
+            g.DrawLine(grid, left, bottom, chartRight, bottom);
+        }
+        TextRenderer.DrawText(g, Fun.Dist(scale), note, new Point((int)chartRight + S(4), (int)top - S(8)), pal.Secondary);
+        TextRenderer.DrawText(g, "0", note, new Point((int)chartRight + S(4), (int)bottom - S(8)), pal.Secondary);
+
+        string[] letters = { "M", "T", "W", "T", "F", "S", "S" };
+        float slot = (chartRight - left) / 7f, bw = slot * 0.56f;
+        Color past = pal.Dark ? Palette.Hex(0x4A4A4E) : Palette.Hex(0xC9C9C5);
+        int today = st.DaysSoFar - 1;
+        for (int i = 0; i < 7; i++)
+        {
+            float cx = left + slot * i + slot / 2;
+            if (i <= today && st.WeekDays[i] > 0)
+            {
+                float h = (float)Math.Max(S(3), (bottom - top) * st.WeekDays[i] / scale);
+                var bar = new RectangleF(cx - bw / 2, bottom - h, bw, h);
+                using (var path = Art.Round(bar, Math.Min(S(3), h / 2)))
+                {
+                    using (var b = new SolidBrush(i == today ? pal.Accent : past)) g.FillPath(b, path);
+                    if (i == today && !pal.Dark) using (var p = new Pen(pal.AccentText)) g.DrawPath(p, path);
+                }
+            }
+            using (var f = Fonts.Ui(8.5f, i == today ? FontStyle.Bold : FontStyle.Regular))
+                TextRenderer.DrawText(g, letters[i], f, new Rectangle((int)(cx - S(10)), (int)bottom + S(6), S(20), S(16)),
+                    i == today ? pal.Content : pal.Secondary, TextFormatFlags.HorizontalCenter);
+        }
+
+        // the daily-average line, dashed, labelled "avg" like Screen Time
+        if (avg > 0)
+        {
+            float ay = bottom - (float)((bottom - top) * avg / scale);
+            using (var pen = new Pen(pal.Dark ? pal.Accent : pal.AccentText, S(1.5f)) { DashPattern = new float[] { 3, 3 } })
+                g.DrawLine(pen, left, ay, chartRight, ay);
+            TextRenderer.DrawText(g, "avg", note, new Point((int)chartRight + S(4), (int)ay - S(8)), pal.Dark ? pal.Accent : pal.AccentText);
+        }
+    }
+
+    void DrawLifetime(Graphics g, RectangleF r, Stats st, Font small, Font big, Font note)
+    {
+        Card(g, r);
+        int x0 = (int)r.X + S(12);
+        TextRenderer.DrawText(g, "LIFETIME", small, new Point(x0, (int)r.Y + S(9)), pal.Secondary);
+        string since = st.Pcs > 1
+            ? "since " + st.Since.ToString("d MMM", Fun.CI) + " · " + st.Pcs + " PCs"
+            : "since " + st.Since.ToString("d MMM yyyy", Fun.CI);
+        TextRenderer.DrawText(g, since, note, new Point(x0, (int)r.Y + S(27)), pal.Secondary);
+        TextRenderer.DrawText(g, Fun.Dist(st.AllTime), big, new Rectangle(x0, (int)r.Y, (int)r.Width - S(24), (int)r.Height),
+            pal.Content, TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
     }
 
     void DrawRoad(Graphics g, RectangleF r, float frac)
@@ -1375,18 +1677,6 @@ class Popup : Form
         float mw = r.Height * 0.8f, mh = mw * 1.4f;
         Art.DrawMouse(g, new RectangleF(-mw / 2, -mh / 2, mw, mh), Art.Yellow);
         g.Restore(state);
-    }
-
-    void DrawTile(Graphics g, RectangleF r, string label, string value, string note, Font small, Font big, Font noteFont)
-    {
-        using (var path = Art.Round(r, S(12)))
-        {
-            using (var b = new SolidBrush(pal.Raised)) g.FillPath(b, path);
-            if (!pal.Dark) using (var p = new Pen(pal.Hairline)) g.DrawPath(p, path);
-        }
-        TextRenderer.DrawText(g, label, small, new Point((int)r.X + S(12), (int)r.Y + S(12)), pal.Secondary);
-        TextRenderer.DrawText(g, value, big, new Point((int)r.X + S(10), (int)r.Y + S(32)), pal.Content);
-        TextRenderer.DrawText(g, note, noteFont, new Point((int)r.X + S(12), (int)r.Y + S(64)), pal.Secondary);
     }
 }
 
@@ -1926,6 +2216,69 @@ static class Art
         }
     }
 
+    public static int TrayIconSize()
+    {
+        using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) return (int)Math.Round(16 * g.DpiX / 96f);
+    }
+
+    // What the tray shows for this week's distance: "0.9", "5.2", "12", "123" (always km, max 3 digits).
+    public static string WeekLabel(double meters)
+    {
+        double km = meters / 1000;
+        if (km < 9.95) return km.ToString("0.0", Fun.CI);
+        if (km < 999.5) return Math.Round(km).ToString("0", Fun.CI);
+        return "999";
+    }
+
+    // Is the taskbar light? (It follows "Windows mode", separate from the apps' light/dark setting.)
+    public static bool TaskbarLight()
+    {
+        try
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+            {
+                object v = k == null ? null : k.GetValue("SystemUsesLightTheme");
+                return v is int && (int)v != 0;
+            }
+        }
+        catch { return false; }
+    }
+
+    // The tray icon as a number: this week's km drawn as large as the icon allows, no box,
+    // in the taskbar's text color, over a short road-yellow lane line.
+    public static Bitmap NumberIcon(string text, int s, bool lightTaskbar)
+    {
+        var bmp = new Bitmap(s, s, PixelFormat.Format32bppArgb);
+        using (Graphics g = Graphics.FromImage(bmp))
+        {
+            g.Clear(Color.Transparent);
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+
+            float lane = Math.Max(2f, (float)Math.Round(s * 0.13f));
+            using (var b = new SolidBrush(lightTaskbar ? Palette.Hex(0x8A5A00) : Yellow))
+            using (var p = Round(new RectangleF(s * 0.12f, s - lane - 0.5f, s * 0.76f, lane), lane / 2)) g.FillPath(b, p);
+
+            // the largest bold size whose digits fit above the lane
+            var area = new RectangleF(0, 0, s, s - lane - 1);
+            using (var sf = new StringFormat(StringFormat.GenericTypographic) { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+            {
+                Font font = null;
+                for (float px = s * 1.1f; px > 4; px -= 0.25f)
+                {
+                    if (font != null) font.Dispose();
+                    font = Fonts.DisplayPx(px, FontStyle.Bold);
+                    SizeF m = g.MeasureString(text, font, 1000, sf);
+                    if (m.Width <= s && m.Height * 0.78f <= area.Height) break; // digits have no descenders
+                }
+                using (var b = new SolidBrush(lightTaskbar ? Ink : Paper))
+                    g.DrawString(text, font, b, new RectangleF(0, area.Y + area.Height * 0.06f, s, area.Height), sf);
+                font.Dispose();
+            }
+        }
+        return bmp;
+    }
+
     public static Icon MakeTrayIcon()
     {
         int size;
@@ -2033,6 +2386,20 @@ static class SelfTest
         foreach (double v in new double[] { 3, 42, 487, 1404, 23456, 212000 })
             sb.AppendLine(v + " m -> " + Fun.Dist(v) + " | " + Fun.Compare(v) + " | level " + Fun.Level(v));
         sb.AppendLine("reduced motion: " + Native.ReducedMotion());
+
+        // sync across PCs, against a fake second PC in a scratch folder (no real data is written)
+        string syncRoot = Path.Combine(outDir, "sync-test");
+        Directory.CreateDirectory(Path.Combine(syncRoot, "Mouse Travel"));
+        File.WriteAllText(Path.Combine(syncRoot, "Mouse Travel", "OFFICE-PC.csv"),
+            Fun.DayKey(DateTime.Now) + ",500\n" + Fun.DayKey(DateTime.Now.AddDays(-1)) + ",1200\n");
+        var syncStore = new Store();
+        syncStore.SetS("sync.dir", syncRoot);
+        syncStore.Set(Fun.DayKey(DateTime.Now), 300);
+        syncStore.SyncExchange();
+        sb.AppendLine("sync: other PCs = " + string.Join(",", syncStore.OtherPcs.ToArray()) +
+            " | other today = " + syncStore.OtherGet(DateTime.Now) + " | other total = " + syncStore.OtherTotal() +
+            " | my file written = " + File.Exists(Path.Combine(syncRoot, "Mouse Travel", Store.PcName + ".csv")) +
+            " | combined today = " + (syncStore.Get(DateTime.Now) + syncStore.OtherGet(DateTime.Now)));
         File.WriteAllText(Path.Combine(outDir, "report.txt"), sb.ToString());
 
         // the icon at its real sizes on a dark and a light taskbar
@@ -2054,6 +2421,22 @@ static class SelfTest
             strip.Save(Path.Combine(outDir, "logo.png"), ImageFormat.Png);
         }
 
+        // the "this week" number icon at real tray sizes (100%, 125%, 150%, 200% scaling)
+        string[] labels = { "0.9", "5.2", "12", "123" };
+        int[] traySizes = { 16, 20, 24, 32 };
+        using (var strip = new Bitmap(420, 240))
+        using (var g = Graphics.FromImage(strip))
+        {
+            g.Clear(Palette.Hex(0x202020));
+            using (var light = new SolidBrush(Palette.Hex(0xEEEEEC))) g.FillRectangle(light, 0, 120, 420, 120);
+            for (int row = 0; row < 2; row++)
+                for (int si = 0; si < traySizes.Length; si++)
+                    for (int li = 0; li < labels.Length; li++)
+                        using (var icon = Art.NumberIcon(labels[li], traySizes[si], row == 1))
+                            g.DrawImageUnscaled(icon, 14 + li * 100 + si * 0, row * 120 + 10 + si * 26);
+            strip.Save(Path.Combine(outDir, "tray-number.png"), ImageFormat.Png);
+        }
+
         double[] days = { 820, 1430, 960, 2210, 1780, 310, 120 };
         using (var card = Art.MakeCard(days, Fun.WeekStart(DateTime.Now), 48210, true)) card.Save(Path.Combine(outDir, "card.png"), ImageFormat.Png);
 
@@ -2062,7 +2445,14 @@ static class SelfTest
             Palette.ForceDark = dark;
             string tag = dark ? "dark" : "light";
             // 1.456 km: the tenths wheel is caught mid-roll
-            using (var p = new Popup(delegate { return new Stats { Today = 1456, Week = 5230, AllTime = 48210, Since = new DateTime(2026, 11, 2) }; }, 1.456))
+            using (var p = new Popup(delegate
+            {
+                return new Stats
+                {
+                    Today = 1456, Week = 8020, AllTime = 48210, Since = new DateTime(2026, 11, 2), Pcs = 2,
+                    WeekDays = new double[] { 820, 1430, 960, 2210, 1144, 1456, 0 }, LastWeek = 5100, DaysSoFar = 6,
+                };
+            }, 1.456))
                 Snap(p, Path.Combine(outDir, "popup-" + tag + ".png"));
             using (var f = new SetupForm(mons.ToArray(), true, false))
                 Snap(f, Path.Combine(outDir, "setup-" + tag + ".png"));
